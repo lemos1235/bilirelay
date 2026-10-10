@@ -1,0 +1,62 @@
+# Copy to config.toml and set upstream credentials.
+
+[server]
+bind = "127.0.0.1:40100"
+# Empty client_tokens is only allowed on loopback addresses.
+client_tokens = ["sk-relay-token"]
+# Omit to disable GET /admin/upstreams.
+admin_token = "sk-relay-admin-token"
+# Total request deadline, including queueing and failover.
+request_deadline_secs = 115
+# Maximum queue wait when no upstream is available.
+queue_wait_secs = 20
+max_body_bytes = 4194304
+
+[[groups]]
+name = "translate"
+# The only supported strategy; also the default.
+strategy = "priority"
+max_attempts = 3
+# Upstreams are preferred in this order.
+upstreams = ["fast-free", "good-limited", "good-paid"]
+
+[[upstreams]]
+name = "fast-free"
+# Use for Chat Completions-only upstreams; the default is responses.
+api = "chat_completions"
+base_url = "https://api.example-b.com/v1"
+api_key = "sk-fast-free-key"
+model = "model-b"
+max_concurrency = 5
+timeout_secs = 3
+
+[[upstreams]]
+name = "good-limited"
+base_url = "https://index-translate.bilibili.com/v1"
+api_key = "sk-good-limited-key"
+model = "Index-Translate-35B-A3B"
+tier = 1
+# Reserve estimated tokens before sending; settle with actual usage.
+tpm = 60000
+# Reserve input + max_output_tokens (default 4096) instead of input x 2.
+# tpm_count_max_output = true
+max_concurrency = 3
+# Wait for capacity or budget before falling back; skip cooling upstreams.
+wait_for_slot_secs = 3
+timeout_secs = 100
+
+[[upstreams]]
+name = "good-paid"
+base_url = "https://api.example-c.com/v1"
+api_key = "sk-good-paid-key"
+model = "model-c"
+tier = 2
+rpm = 30000
+tpm = 5000000
+
+# Optional upstream settings:
+# tier = 0                         # Minimum requested tier is set by X-Model-Tier.
+# enabled = false                  # Temporarily disable this upstream.
+# drop_fields = ["store"]          # Remove top-level fields before forwarding.
+# override = { reasoning = { effort = "low" } } # Deep-merge request overrides.
+# extra_headers = "X-Foo: a; X-Bar: b" # Extra request headers, separated by semicolons.

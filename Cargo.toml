@@ -1,0 +1,16 @@
+[package]
+name = "bilirelay"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.7"
+bytes = "1.12.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

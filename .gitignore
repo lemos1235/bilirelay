@@ -1,0 +1,13 @@
+.idea/
+.vscode/
+.pi/
+.zcode/
+.DS_Store
+
+target/
+
+# Custom
+/*.sh
+config.toml
+*_*.md
+
