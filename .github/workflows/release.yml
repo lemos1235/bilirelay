@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: pack
+        shell: bash
+        run: |
+          name="bilirelay-${{ inputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/bilirelay" "dist/$name/"
+          cp config.example.toml README.md "dist/$name/"
+          cd dist
+          tar -czf "$name.tar.gz" "$name"
+          echo "asset=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: ${{ steps.pack.outputs.asset }}
