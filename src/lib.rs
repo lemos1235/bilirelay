@@ -2,8 +2,10 @@ pub mod classify;
 pub mod config;
 pub mod convert;
 pub mod error;
+pub mod monitor;
 pub mod pool;
 pub mod proxy;
+pub mod stats;
 pub mod tokens;
 pub mod upstream;
 
@@ -21,11 +23,13 @@ use serde_json::json;
 use crate::config::Config;
 use crate::error::{api_error, bearer_matches};
 use crate::pool::Pool;
+use crate::stats::RelayStats;
 
 pub struct AppState {
     pub config: Config,
     pub pool: Pool,
     pub client: reqwest::Client,
+    pub stats: RelayStats,
 }
 
 pub fn build_app(config: Config) -> anyhow::Result<Router> {
@@ -39,6 +43,7 @@ pub fn build_app(config: Config) -> anyhow::Result<Router> {
         pool: Pool::new(&config),
         config,
         client,
+        stats: RelayStats::default(),
     });
     Ok(Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -65,5 +70,10 @@ async fn admin_upstreams(State(app): State<Arc<AppState>>, headers: HeaderMap) -
         .iter()
         .map(|g| json!({ "name": g.name, "strategy": g.strategy, "max_attempts": g.max_attempts, "upstreams": g.upstreams }))
         .collect();
-    Json(json!({ "groups": groups, "upstreams": app.pool.upstream_status() })).into_response()
+    Json(json!({
+        "relay": app.stats.status(),
+        "groups": groups,
+        "upstreams": app.pool.upstream_status(),
+    }))
+    .into_response()
 }

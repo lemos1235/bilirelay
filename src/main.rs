@@ -6,6 +6,12 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mut args = std::env::args_os().skip(1).peekable();
+    if args.peek().is_some_and(|a| a == "monitor") {
+        let options = bilirelay::monitor::parse_args(args.skip(1))?;
+        return bilirelay::monitor::run(options).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -54,7 +60,7 @@ where
         let lossy = os_str.to_string_lossy();
         if lossy == "-h" || lossy == "--help" {
             println!(
-                "Usage: bilirelay [-c|--config <PATH>] [PATH]\n\nDefault configuration: config.toml in the current working directory"
+                "Usage: bilirelay [-c|--config <PATH>] [PATH]\n       bilirelay monitor [--help]\n\nDefault configuration: config.toml in the current working directory"
             );
             std::process::exit(0);
         } else if lossy == "-c" || lossy == "--config" {

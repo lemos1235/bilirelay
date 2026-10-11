@@ -12,6 +12,7 @@ use crate::classify::{Failure, Verdict, classify_status};
 use crate::config::{UpstreamApi, UpstreamConfig};
 use crate::convert;
 use crate::error::{api_error, bearer_matches};
+use crate::stats::Saturated;
 use crate::tokens;
 use crate::upstream::Spend;
 
@@ -28,7 +29,13 @@ pub async fn responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    forward(&app, &headers, &body).await
+    let _inflight = app.stats.begin();
+    let started = Instant::now();
+    let response = forward(&app, &headers, &body).await;
+    let saturated = response.extensions().get::<Saturated>().is_some();
+    app.stats
+        .finish(response.status(), saturated, started.elapsed());
+    response
 }
 
 struct UpstreamReply {
@@ -290,6 +297,7 @@ async fn forward(app: &AppState, headers: &HeaderMap, body: &Bytes) -> Response 
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+            response.extensions_mut().insert(Saturated);
             response
         }
     }

@@ -16,6 +16,7 @@ pub struct Upstream {
     success: AtomicU64,
     rate_limited: AtomicU64,
     errors: AtomicU64,
+    tokens: AtomicU64,
     latency_ewma_ms: AtomicU64,
 }
 
@@ -93,6 +94,7 @@ impl Upstream {
             success: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            tokens: AtomicU64::new(0),
             latency_ewma_ms: AtomicU64::new(0),
         }
     }
@@ -178,6 +180,9 @@ impl Upstream {
         remaining_tokens: Option<u64>,
     ) -> Option<Penalty> {
         self.requests.fetch_add(1, Ordering::Relaxed);
+        if let Spend::Actual(used) = spend {
+            self.tokens.fetch_add(used, Ordering::Relaxed);
+        }
         let now = Instant::now();
         let mut health = self.health.lock().unwrap();
         if let Some(bucket) = health.tpm.as_mut() {
@@ -285,6 +290,7 @@ impl Upstream {
             success: self.success.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            tokens: self.tokens.load(Ordering::Relaxed),
             latency_ewma_ms: self.latency_ewma_ms.load(Ordering::Relaxed),
             tpm_limit: self.cfg.tpm,
             tpm_available,
@@ -308,6 +314,7 @@ pub struct UpstreamStatus {
     pub success: u64,
     pub rate_limited: u64,
     pub errors: u64,
+    pub tokens: u64,
     pub latency_ewma_ms: u64,
     pub tpm_limit: Option<u64>,
     pub tpm_available: Option<i64>,
