@@ -9,14 +9,16 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
 
-use crate::AppState;
 use crate::classify::{Failure, Verdict, classify_status};
+use crate::clients::Client;
 use crate::config::{UpstreamApi, UpstreamConfig};
 use crate::convert;
-use crate::error::{api_error, bearer_matches};
-use crate::stats::Saturated;
-use crate::tokens;
+use crate::error::api_error;
+use crate::pool::GroupInfo;
+use crate::stats::{Rejection, Usage};
+use crate::tokens::{self, RequestSize};
 use crate::upstream::Spend;
+use crate::{AppState, Live};
 
 const MODEL_TIER_HEADER: &str = "x-model-tier";
 
@@ -33,122 +35,152 @@ pub async fn responses(
 ) -> Response {
     let _inflight = app.stats.begin();
     let started = Instant::now();
-    let response = forward(&app, &headers, &body).await;
-    let saturated = response.extensions().get::<Saturated>().is_some();
-    app.stats
-        .finish(response.status(), saturated, started.elapsed());
+    let live = app.live();
+    let response = match live.clients.authenticate(&headers) {
+        Some(client) => {
+            let _client_inflight = client.stats.begin();
+            let response = serve(&app, &live, &client, &headers, &body).await;
+            client.stats.finish(&response, started.elapsed());
+            response
+        }
+        None => api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "invalid or missing relay token",
+        ),
+    };
+    app.stats.finish(&response, started.elapsed());
     response
 }
 
-struct UpstreamReply {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Bytes,
+async fn serve(
+    app: &AppState,
+    live: &Live,
+    client: &Client,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Response {
+    let request = match prepare(live, headers, body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let reservation = match client.admit(&request.size) {
+        Ok(reservation) => reservation,
+        Err(wait) => {
+            tracing::warn!(client = %client.name, "client quota exceeded");
+            return too_many_requests(
+                "client_quota_exceeded",
+                format!("client '{}' exceeded its rpm / tpm quota", client.name),
+                Some(wait),
+                Rejection::Quota,
+            );
+        }
+    };
+    let response = dispatch(app, live, &request).await;
+    client.settle(reservation, &response);
+    response
 }
 
-enum Attempt {
+pub(crate) struct UpstreamReply {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Bytes,
+}
+
+pub(crate) enum Attempt {
     Reply(UpstreamReply),
     NetworkError(String),
 }
 
-async fn forward(app: &AppState, headers: &HeaderMap, body: &Bytes) -> Response {
-    let server = &app.config.server;
-    if !server.client_tokens.is_empty()
-        && !server
-            .client_tokens
-            .iter()
-            .any(|t| bearer_matches(headers, t))
-    {
-        return api_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_api_key",
-            "invalid or missing relay token",
-        );
-    }
+/// A validated client request, ready to be sent to the members of its group.
+struct Prepared {
+    payload: Map<String, Value>,
+    chat_payload: Option<Map<String, Value>>,
+    group_name: String,
+    min_tier: u32,
+    group: GroupInfo,
+    size: RequestSize,
+}
 
+#[allow(clippy::result_large_err)] // the error is the response itself, built once
+fn prepare(live: &Live, headers: &HeaderMap, body: &Bytes) -> Result<Prepared, Response> {
+    let invalid = |message: String| api_error(StatusCode::BAD_REQUEST, "invalid_request", message);
     let payload = match serde_json::from_slice::<Value>(body) {
         Ok(Value::Object(map)) => map,
-        Ok(_) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                "request body must be a JSON object",
-            );
-        }
-        Err(error) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                format!("request body is not valid JSON: {error}"),
-            );
-        }
+        Ok(_) => return Err(invalid("request body must be a JSON object".into())),
+        Err(error) => return Err(invalid(format!("request body is not valid JSON: {error}"))),
     };
     let Some(group_name) = payload
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string)
     else {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "request body is missing the model field",
-        );
+        return Err(invalid("request body is missing the model field".into()));
     };
     let min_tier = match headers.get(MODEL_TIER_HEADER) {
         None => 0,
-        Some(value) => match value
+        Some(value) => value
             .to_str()
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-        {
-            Some(tier) => tier,
-            None => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    format!("{MODEL_TIER_HEADER} must be a non-negative integer"),
-                );
-            }
-        },
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{MODEL_TIER_HEADER} must be a non-negative integer"
+                ))
+            })?,
     };
-    let Some(group) = app.pool.group(&group_name, min_tier) else {
-        return api_error(
+    let Some(group) = live.pool.group(&group_name, min_tier) else {
+        return Err(api_error(
             StatusCode::BAD_REQUEST,
             "model_not_found",
             format!(
                 "unknown model group '{group_name}'; available groups: {}",
-                app.pool.group_names().join(", ")
+                live.pool.group_names().join(", ")
             ),
-        );
+        ));
     };
     if group.members == 0 {
-        return api_error(
+        return Err(api_error(
             StatusCode::BAD_REQUEST,
             "model_not_found",
             format!("model group '{group_name}' has no upstreams with tier >= {min_tier}"),
-        );
+        ));
     }
     if payload.get("stream").and_then(Value::as_bool) == Some(true) {
-        return api_error(
+        return Err(api_error(
             StatusCode::BAD_REQUEST,
             "unsupported",
             "relay does not support streaming responses (stream=true)",
-        );
+        ));
     }
 
-    let chat_payload = if app.config.group_uses_chat(&group_name) {
+    let chat_payload = if live.config.group_uses_chat(&group_name) {
         match convert::request_to_chat(&payload) {
             Ok(chat) => Some(chat),
-            Err(message) => return api_error(StatusCode::BAD_REQUEST, "unsupported", message),
+            Err(message) => {
+                return Err(api_error(StatusCode::BAD_REQUEST, "unsupported", message));
+            }
         }
     } else {
         None
     };
-
     let size = tokens::measure(&payload);
+    Ok(Prepared {
+        payload,
+        chat_payload,
+        group_name,
+        min_tier,
+        group,
+        size,
+    })
+}
+
+async fn dispatch(app: &AppState, live: &Live, request: &Prepared) -> Response {
+    let server = &live.config.server;
+    let group_name = &request.group_name;
     let started = Instant::now();
     let deadline = started + server.request_deadline();
-    let attempt_budget = group.max_attempts.min(group.members);
+    let attempt_budget = request.group.max_attempts.min(request.group.members);
     let mut tried: Vec<usize> = Vec::new();
     let mut tried_names: Vec<String> = Vec::new();
     let mut last: Option<Attempt> = None;
@@ -160,9 +192,15 @@ async fn forward(app: &AppState, headers: &HeaderMap, body: &Bytes) -> Response 
             break;
         }
         let wait_until = (now + server.queue_wait()).min(deadline);
-        let lease = match app
+        let lease = match live
             .pool
-            .acquire(&group_name, &tried, min_tier, &size, wait_until)
+            .acquire(
+                group_name,
+                &tried,
+                request.min_tier,
+                &request.size,
+                wait_until,
+            )
             .await
         {
             Ok(lease) => lease,
@@ -172,59 +210,25 @@ async fn forward(app: &AppState, headers: &HeaderMap, body: &Bytes) -> Response 
             }
         };
         tried.push(lease.index);
-        let upstream = &lease.upstream.cfg;
+        let upstream = lease.upstream.cfg();
         tried_names.push(upstream.name.clone());
 
         let base = match upstream.api {
-            UpstreamApi::Responses => &payload,
-            UpstreamApi::ChatCompletions => chat_payload.as_ref().expect(
+            UpstreamApi::Responses => &request.payload,
+            UpstreamApi::ChatCompletions => request.chat_payload.as_ref().expect(
                 "payload has already been converted when the group contains a chat upstream",
             ),
         };
-        let request_body = rewrite(base, upstream);
-        let url = format!(
-            "{}/{}",
-            upstream.base_url.trim_end_matches('/'),
-            upstream.api.path()
-        );
         let timeout = upstream
             .timeout()
             .min(deadline.saturating_duration_since(Instant::now()));
         let attempt_started = Instant::now();
-        let attempt = send(&app.client, &url, upstream, request_body, timeout).await;
+        let attempt = send(&app.client, &upstream, rewrite(base, &upstream), timeout).await;
         let latency = attempt_started.elapsed();
 
         match attempt {
-            Attempt::Reply(mut reply) => {
-                let mut verdict = classify_status(reply.status.as_u16(), &reply.headers);
-                let mut malformed = false;
-                if verdict == Verdict::Success && upstream.api == UpstreamApi::ChatCompletions {
-                    match convert::response_from_chat(&reply.body) {
-                        Some(body) => {
-                            reply.body = body.into();
-                            reply.headers.insert(
-                                header::CONTENT_TYPE,
-                                HeaderValue::from_static("application/json"),
-                            );
-                        }
-                        None => {
-                            verdict = Verdict::Failover(Failure::Transient);
-                            malformed = true;
-                            reply = malformed_reply(&upstream.name);
-                        }
-                    }
-                }
-                let spend = match verdict {
-                    _ if malformed => Spend::Estimate,
-                    Verdict::Success => {
-                        tokens::usage_tokens(&reply.body).map_or(Spend::Estimate, Spend::Actual)
-                    }
-                    Verdict::ClientError => {
-                        tokens::usage_tokens(&reply.body).map_or(Spend::Refund, Spend::Actual)
-                    }
-                    Verdict::Failover(Failure::RateLimited { .. }) => Spend::Exhausted,
-                    Verdict::Failover(_) => Spend::Refund,
-                };
+            Attempt::Reply(reply) => {
+                let (reply, verdict, spend) = assess(&upstream, reply);
                 let remaining = tokens::remaining_tokens(&reply.headers);
                 let penalty =
                     lease
@@ -241,11 +245,15 @@ async fn forward(app: &AppState, headers: &HeaderMap, body: &Bytes) -> Response 
                             total_ms = started.elapsed().as_millis() as u64,
                             "forwarded"
                         );
-                        return reply_to_client(reply, &tried_names);
+                        let usage = match spend {
+                            Spend::Actual(used) => Some(used),
+                            _ => None,
+                        };
+                        return reply_to_client(reply, &tried_names, usage);
                     }
                     Verdict::Failover(failure) => {
                         log_failover(
-                            &group_name,
+                            group_name,
                             &upstream.name,
                             failure,
                             &penalty,
@@ -276,7 +284,7 @@ async fn forward(app: &AppState, headers: &HeaderMap, body: &Bytes) -> Response 
     }
 
     match last {
-        Some(Attempt::Reply(reply)) => reply_to_client(reply, &tried_names),
+        Some(Attempt::Reply(reply)) => reply_to_client(reply, &tried_names, None),
         Some(Attempt::NetworkError(message)) => {
             let mut response = api_error(
                 StatusCode::from_u16(502).expect("valid HTTP status"),
@@ -288,21 +296,70 @@ async fn forward(app: &AppState, headers: &HeaderMap, body: &Bytes) -> Response 
         }
         None => {
             tracing::warn!(group = %group_name, "all upstreams saturated");
-            let mut response = api_error(
-                StatusCode::TOO_MANY_REQUESTS,
+            too_many_requests(
                 "relay_saturated",
                 format!(
                     "all upstreams in model group '{group_name}' are busy or cooling down; please retry later"
                 ),
-            );
-            let secs = saturated_retry_after.map_or(1, |d| d.as_secs_f64().ceil().max(1.0) as u64);
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
-            response.extensions_mut().insert(Saturated);
-            response
+                saturated_retry_after,
+                Rejection::Saturated,
+            )
         }
     }
+}
+
+/// Classifies an upstream reply and decides how its tokens settle. Successful Chat Completions
+/// replies are converted to the Responses shape; unreadable ones become a transient failure.
+pub(crate) fn assess(
+    upstream: &UpstreamConfig,
+    mut reply: UpstreamReply,
+) -> (UpstreamReply, Verdict, Spend) {
+    let verdict = classify_status(reply.status.as_u16(), &reply.headers);
+    if verdict == Verdict::Success && upstream.api == UpstreamApi::ChatCompletions {
+        match convert::response_from_chat(&reply.body) {
+            Some(body) => {
+                reply.body = body.into();
+                reply.headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+            }
+            None => {
+                return (
+                    malformed_reply(&upstream.name),
+                    Verdict::Failover(Failure::Transient),
+                    Spend::Estimate,
+                );
+            }
+        }
+    }
+    let spend = match verdict {
+        Verdict::Success => {
+            tokens::usage_tokens(&reply.body).map_or(Spend::Estimate, Spend::Actual)
+        }
+        Verdict::ClientError => {
+            tokens::usage_tokens(&reply.body).map_or(Spend::Refund, Spend::Actual)
+        }
+        Verdict::Failover(Failure::RateLimited { .. }) => Spend::Exhausted,
+        Verdict::Failover(_) => Spend::Refund,
+    };
+    (reply, verdict, spend)
+}
+
+/// A 429 the relay produces itself, tagged so stats can tell it from an upstream's.
+fn too_many_requests(
+    code: &str,
+    message: String,
+    retry_after: Option<Duration>,
+    rejection: Rejection,
+) -> Response {
+    let mut response = api_error(StatusCode::TOO_MANY_REQUESTS, code, message);
+    let secs = retry_after.map_or(1, |d| d.as_secs_f64().ceil().max(1.0) as u64);
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+    response.extensions_mut().insert(rejection);
+    response
 }
 
 fn malformed_reply(upstream: &str) -> UpstreamReply {
@@ -340,13 +397,17 @@ fn log_failover(
     }
 }
 
-async fn send(
+pub(crate) async fn send(
     client: &reqwest::Client,
-    url: &str,
     upstream: &UpstreamConfig,
     body: Vec<u8>,
     timeout: Duration,
 ) -> Attempt {
+    let url = format!(
+        "{}/{}",
+        upstream.base_url.trim_end_matches('/'),
+        upstream.api.path()
+    );
     let response = match client
         .post(url)
         .bearer_auth(&upstream.api_key)
@@ -411,8 +472,11 @@ fn merge(target: &mut Map<String, Value>, patch: &Map<String, Value>) {
     }
 }
 
-fn reply_to_client(reply: UpstreamReply, tried_names: &[String]) -> Response {
+fn reply_to_client(reply: UpstreamReply, tried_names: &[String], usage: Option<u64>) -> Response {
     let mut response = (reply.status, reply.body).into_response();
+    if let Some(tokens) = usage {
+        response.extensions_mut().insert(Usage(tokens));
+    }
     for name in PASSTHROUGH_HEADERS {
         if let Some(value) = reply.headers.get(&name) {
             response.headers_mut().insert(name, value.clone());

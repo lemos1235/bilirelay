@@ -1,16 +1,26 @@
 # Copy to config.toml and set upstream credentials.
+# Edits are picked up while running (or on SIGHUP); bind and max_body_bytes need a restart.
 
 [server]
 bind = "127.0.0.1:40100"
-# Empty client_tokens is only allowed on loopback addresses.
+# Unnamed, unlimited client tokens (reported as client-1, client-2, ...). With neither
+# client_tokens nor [[clients]], only loopback binds are allowed.
 client_tokens = ["sk-relay-token"]
-# Omit to disable GET /admin/upstreams.
+# Omit to disable GET /admin/upstreams and GET /metrics (Prometheus).
 admin_token = "sk-relay-admin-token"
 # Total request deadline, including queueing and failover.
 request_deadline_secs = 115
 # Maximum queue wait when no upstream is available.
 queue_wait_secs = 20
 max_body_bytes = 4194304
+
+# Named clients with optional per-minute quotas; over-quota requests get 429 + Retry-After.
+[[clients]]
+name = "batch-jobs"
+token = "sk-relay-batch-token"
+rpm = 600
+# Estimated as input x 2 up front, then settled with reported usage.
+tpm = 2000000
 
 [[groups]]
 name = "translate"
@@ -60,3 +70,4 @@ tpm = 5000000
 # drop_fields = ["store"]          # Remove top-level fields before forwarding.
 # override = { reasoning = { effort = "low" } } # Deep-merge request overrides.
 # extra_headers = "X-Foo: a; X-Bar: b" # Extra request headers, separated by semicolons.
+# health_check_secs = 30           # While unhealthy, probe with a tiny request every N seconds.

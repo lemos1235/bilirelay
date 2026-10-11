@@ -7,6 +7,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use bilirelay::AppState;
 use bilirelay::config::Config;
 use serde_json::{Value, json};
 
@@ -102,6 +103,19 @@ fn status(code: u16) -> impl Fn(usize) -> (u16, Vec<(&'static str, &'static str)
 }
 
 async fn relay(server_extra: &str, upstreams: &[(&str, &str, &str)]) -> String {
+    start(&config_text(server_extra, "", upstreams)).await.0
+}
+
+async fn start(text: &str) -> (String, Arc<AppState>) {
+    let state = AppState::new(Config::parse(text).unwrap()).unwrap();
+    let app = bilirelay::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), state)
+}
+
+fn config_text(server_extra: &str, tail: &str, upstreams: &[(&str, &str, &str)]) -> String {
     let names: Vec<String> = upstreams
         .iter()
         .map(|(n, _, _)| format!("\"{n}\""))
@@ -132,12 +146,8 @@ async fn relay(server_extra: &str, upstreams: &[(&str, &str, &str)]) -> String {
             "#
         ));
     }
-    let config = Config::parse(&text).unwrap();
-    let app = bilirelay::build_app(config).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://{addr}")
+    text.push_str(tail);
+    text
 }
 
 struct Reply {
@@ -1067,4 +1077,159 @@ async fn garbage_chat_upstream() -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{addr}/v1")
+}
+
+const QUOTA_CLIENT: &str = r#"
+    [[clients]]
+    name = "alice"
+    token = "alice-token"
+    rpm = 1
+"#;
+
+#[tokio::test]
+async fn client_quota_rejects_without_touching_upstreams_and_is_reported() {
+    let (a_url, a) = mock_upstream(Duration::ZERO, ok()).await;
+    let (relay_url, _) = start(&config_text("", QUOTA_CLIENT, &[("a", &a_url, "")])).await;
+
+    assert_eq!(call(&relay_url, "alice-token", request()).await.status, 200);
+    let limited = call(&relay_url, "alice-token", request()).await;
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.body["error"]["code"], "client_quota_exceeded");
+    assert!(limited.header("retry-after").parse::<u64>().unwrap() >= 1);
+    assert_eq!(a.calls().len(), 1);
+    assert_eq!(
+        call(&relay_url, "client-token", request()).await.status,
+        200,
+        "other clients have their own quota"
+    );
+
+    let status = admin_status(&relay_url).await;
+    assert_eq!(status["relay"]["quota_limited"], 1);
+    assert_eq!(status["relay"]["rate_limited"], 0);
+    assert_eq!(status["relay"]["tokens"], 4);
+    let alice = &status["clients"][0];
+    assert_eq!(alice["name"], "alice");
+    assert_eq!(alice["requests"], 2);
+    assert_eq!(alice["success"], 1);
+    assert_eq!(alice["quota_limited"], 1);
+    assert_eq!(alice["tokens"], 2);
+    assert_eq!(alice["rpm_limit"], 1);
+    assert_eq!(status["clients"][1]["name"], "client-1");
+}
+
+#[tokio::test]
+async fn metrics_require_the_admin_token_and_expose_prometheus_text() {
+    let (a_url, _a) = mock_upstream(Duration::ZERO, ok()).await;
+    let (relay_url, _) = start(&config_text("", QUOTA_CLIENT, &[("a", &a_url, "")])).await;
+    call(&relay_url, "alice-token", request()).await;
+    call(&relay_url, "alice-token", request()).await;
+
+    let get = |token: &'static str| {
+        reqwest::Client::new()
+            .get(format!("{relay_url}/metrics"))
+            .bearer_auth(token)
+            .send()
+    };
+    assert_eq!(get("client-token").await.unwrap().status(), 401);
+    let response = get("admin-token").await.unwrap();
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    let text = response.text().await.unwrap();
+    for line in [
+        "# TYPE bilirelay_requests_total counter",
+        "bilirelay_requests_total{outcome=\"success\"} 1",
+        "bilirelay_requests_total{outcome=\"quota_limited\"} 1",
+        "bilirelay_client_requests_total{client=\"alice\",outcome=\"quota_limited\"} 1",
+        "bilirelay_client_tokens_total{client=\"alice\"} 2",
+        "bilirelay_client_rpm_limit{client=\"alice\"} 1",
+        "bilirelay_upstream_state{upstream=\"a\",state=\"healthy\"} 1",
+        "bilirelay_upstream_state{upstream=\"a\",state=\"cooldown\"} 0",
+        "bilirelay_upstream_responses_total{upstream=\"a\",outcome=\"success\"} 1",
+        "bilirelay_config_reloads_total{result=\"success\"} 0",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in:\n{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reload_keeps_state_and_fixing_a_key_revives_a_disabled_upstream() {
+    let (a_url, a) =
+        mock_upstream(Duration::ZERO, |i| (if i == 0 { 401 } else { 200 }, vec![])).await;
+    let (b_url, _b) = mock_upstream(Duration::ZERO, ok()).await;
+    let upstreams = [("a", a_url.as_str(), ""), ("b", b_url.as_str(), "")];
+    let (relay_url, state) = start(&config_text("", "", &upstreams)).await;
+
+    assert_eq!(
+        call(&relay_url, "client-token", request())
+            .await
+            .header("x-relay-attempts"),
+        "a,b"
+    );
+    assert_eq!(
+        admin_status(&relay_url).await["upstreams"][0]["state"],
+        "disabled"
+    );
+
+    // Same target: the disable survives the reload, and so do the counters.
+    let reworded =
+        config_text("", QUOTA_CLIENT, &upstreams).replace("max_attempts = 3", "max_attempts = 2");
+    state.apply(Config::parse(&reworded).unwrap());
+    let status = admin_status(&relay_url).await;
+    assert_eq!(status["upstreams"][0]["state"], "disabled");
+    assert_eq!(status["upstreams"][0]["requests"], 1);
+    assert_eq!(status["groups"][0]["max_attempts"], 2);
+    assert_eq!(
+        call(&relay_url, "alice-token", request()).await.status,
+        200,
+        "clients added by a reload can authenticate"
+    );
+
+    let fixed = reworded.replace("api_key = \"key-a\"", "api_key = \"key-fixed\"");
+    state.apply(Config::parse(&fixed).unwrap());
+    let reply = call(&relay_url, "client-token", request()).await;
+    assert_eq!(reply.header("x-relay-attempts"), "a");
+    assert_eq!(a.calls().last().unwrap().0, "Bearer key-fixed");
+    assert_eq!(
+        admin_status(&relay_url).await["upstreams"][0]["requests"],
+        2
+    );
+}
+
+#[tokio::test]
+async fn health_check_revives_a_disabled_upstream_without_client_traffic() {
+    let (a_url, a) =
+        mock_upstream(Duration::ZERO, |i| (if i == 0 { 401 } else { 200 }, vec![])).await;
+    let (b_url, _b) = mock_upstream(Duration::ZERO, ok()).await;
+    let (relay_url, state) = start(&config_text(
+        "",
+        "",
+        &[("a", &a_url, "health_check_secs = 1"), ("b", &b_url, "")],
+    ))
+    .await;
+    bilirelay::health::spawn(state);
+
+    assert_eq!(
+        call(&relay_url, "client-token", request())
+            .await
+            .header("x-relay-attempts"),
+        "a,b"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        admin_status(&relay_url).await["upstreams"][0]["state"],
+        "healthy"
+    );
+    let calls = a.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].1["input"], "ping");
+    assert_eq!(calls[1].1["model"], "model-a");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(a.calls().len(), 2, "healthy upstreams are not probed");
 }

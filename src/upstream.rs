@@ -1,5 +1,5 @@
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -10,7 +10,8 @@ use crate::stats::observe_ewma;
 use crate::tokens::{Bucket, RequestSize};
 
 pub struct Upstream {
-    pub cfg: UpstreamConfig,
+    /// Swapped in place on config reload so health, budgets and counters carry over.
+    cfg: RwLock<Arc<UpstreamConfig>>,
     inflight: AtomicUsize,
     health: Mutex<Health>,
     requests: AtomicU64,
@@ -88,7 +89,7 @@ impl Upstream {
             rpm: cfg.rpm.map(|limit| Bucket::per_minute(limit, now)),
         };
         Self {
-            cfg,
+            cfg: RwLock::new(Arc::new(cfg)),
             inflight: AtomicUsize::new(0),
             health: Mutex::new(health),
             requests: AtomicU64::new(0),
@@ -100,13 +101,36 @@ impl Upstream {
         }
     }
 
+    pub fn cfg(&self) -> Arc<UpstreamConfig> {
+        self.cfg.read().unwrap().clone()
+    }
+
+    /// Applies a reloaded configuration. Health is kept unless the upstream now points at a
+    /// different endpoint, key or model, in which case past failures no longer apply.
+    pub fn reconfigure(&self, cfg: UpstreamConfig) {
+        let now = Instant::now();
+        let mut health = self.health.lock().unwrap();
+        let mut current = self.cfg.write().unwrap();
+        if !current.same_target(&cfg) && health.consecutive_failures > 0 {
+            tracing::info!(upstream = %cfg.name, "upstream target changed; clearing its failure history");
+            health.consecutive_failures = 0;
+            health.cooldown_until = None;
+            health.disabled_until = None;
+            health.failure_epoch += 1;
+        }
+        resize(&mut health.tpm, cfg.tpm, now);
+        resize(&mut health.rpm, cfg.rpm, now);
+        *current = Arc::new(cfg);
+    }
+
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::Acquire)
     }
 
     fn token_cost(&self, size: &RequestSize) -> u64 {
-        if self.cfg.tpm.is_some() {
-            size.cost(self.cfg.tpm_count_max_output)
+        let cfg = self.cfg();
+        if cfg.tpm.is_some() {
+            size.cost(cfg.tpm_count_max_output)
         } else {
             0
         }
@@ -120,7 +144,7 @@ impl Upstream {
         if health.half_open(now) && health.probing {
             return Admission::ProbeBusy;
         }
-        if self.inflight() >= self.cfg.max_concurrency {
+        if self.inflight() >= self.cfg().max_concurrency {
             return Admission::Full;
         }
         match health.budget_ready_at(self.token_cost(size), now) {
@@ -138,11 +162,36 @@ impl Upstream {
         if probe && health.probing {
             return None;
         }
+        let ticket = self.reserve(&mut health, size, now, probe)?;
+        if probe {
+            tracing::info!(upstream = %self.cfg().name, failures = health.consecutive_failures, "half-open: sending probe");
+        }
+        Some(ticket)
+    }
+
+    /// Reserves the probe slot for an active health check. Only unhealthy upstreams outside a
+    /// cooldown qualify, which includes ones disabled for rejecting credentials or the model.
+    pub fn try_reserve_check(&self, size: &RequestSize, now: Instant) -> Option<Ticket> {
+        let mut health = self.health.lock().unwrap();
+        let cooling = health.cooldown_until.is_some_and(|until| until > now);
+        if health.consecutive_failures == 0 || cooling || health.probing {
+            return None;
+        }
+        self.reserve(&mut health, size, now, true)
+    }
+
+    fn reserve(
+        &self,
+        health: &mut Health,
+        size: &RequestSize,
+        now: Instant,
+        probe: bool,
+    ) -> Option<Ticket> {
         let tokens = self.token_cost(size);
         if health.budget_ready_at(tokens, now).is_some() {
             return None;
         }
-        let max = self.cfg.max_concurrency;
+        let max = self.cfg().max_concurrency;
         self.inflight
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < max).then_some(n + 1)
@@ -156,7 +205,6 @@ impl Upstream {
         }
         if probe {
             health.probing = true;
-            tracing::info!(upstream = %self.cfg.name, failures = health.consecutive_failures, "half-open: sending probe");
         }
         Some(Ticket {
             probe,
@@ -211,10 +259,12 @@ impl Upstream {
                 observe_ewma(&self.latency_ewma_ms, latency);
                 if fresh {
                     if health.consecutive_failures > 0 {
-                        tracing::info!(upstream = %self.cfg.name, failures = health.consecutive_failures, "upstream recovered");
+                        tracing::info!(upstream = %self.cfg().name, failures = health.consecutive_failures, "upstream recovered");
                     }
                     health.consecutive_failures = 0;
                     health.cooldown_until = None;
+                    // Only a health check can be fresh while disabled: disabling bumps the epoch.
+                    health.disabled_until = None;
                 }
                 None
             }
@@ -245,6 +295,7 @@ impl Upstream {
     }
 
     pub fn status(&self, now: Instant) -> UpstreamStatus {
+        let cfg = self.cfg();
         let mut health = self.health.lock().unwrap();
         let tpm_available = health.tpm.as_mut().map(|b| b.available(now));
         let rpm_available = health.rpm.as_mut().map(|b| b.available(now));
@@ -256,7 +307,7 @@ impl Upstream {
         };
         let disabled_ms = remaining(health.disabled_until);
         let cooldown_ms = remaining(health.cooldown_until);
-        let state = if !self.cfg.enabled {
+        let state = if !cfg.enabled {
             "off"
         } else if disabled_ms > 0 {
             "disabled"
@@ -268,11 +319,11 @@ impl Upstream {
             "healthy"
         };
         UpstreamStatus {
-            name: self.cfg.name.clone(),
-            model: self.cfg.model.clone(),
+            name: cfg.name.clone(),
+            model: cfg.model.clone(),
             state,
             inflight: self.inflight(),
-            max_concurrency: self.cfg.max_concurrency,
+            max_concurrency: cfg.max_concurrency,
             cooldown_remaining_ms: cooldown_ms,
             disabled_remaining_ms: disabled_ms,
             consecutive_failures: health.consecutive_failures,
@@ -282,12 +333,24 @@ impl Upstream {
             errors: self.errors.load(Ordering::Relaxed),
             tokens: self.tokens.load(Ordering::Relaxed),
             latency_ewma_ms: self.latency_ewma_ms.load(Ordering::Relaxed),
-            tpm_limit: self.cfg.tpm,
+            tpm_limit: cfg.tpm,
             tpm_available,
-            rpm_limit: self.cfg.rpm,
+            rpm_limit: cfg.rpm,
             rpm_available,
         }
     }
+}
+
+/// Rebuilds a rate bucket for a reloaded limit, keeping the budget already spent.
+pub(crate) fn resize(slot: &mut Option<Bucket>, limit: Option<u64>, now: Instant) {
+    *slot = match (slot.take(), limit) {
+        (_, None) => None,
+        (Some(mut bucket), Some(limit)) => {
+            bucket.resize(limit, now);
+            Some(bucket)
+        }
+        (None, Some(limit)) => Some(Bucket::per_minute(limit, now)),
+    };
 }
 
 #[derive(Debug, Serialize)]
@@ -513,6 +576,68 @@ mod tests {
         }
         assert_eq!(u.status(now).tpm_available, Some(600));
         assert!(matches!(u.admission(&SIZE, now), Admission::Budget(_)));
+    }
+
+    #[test]
+    fn health_check_only_targets_unhealthy_upstreams_and_lifts_a_disable() {
+        let u = upstream("");
+        let now = Instant::now();
+        assert!(u.try_reserve_check(&SIZE, now).is_none(), "healthy");
+
+        fail(&u, Verdict::Failover(Failure::Misconfigured));
+        assert_eq!(u.status(now).state, "disabled");
+        assert!(u.try_reserve(&SIZE, now).is_none());
+        let check = u
+            .try_reserve_check(&SIZE, now)
+            .expect("disabled upstreams are probed");
+        assert!(
+            u.try_reserve_check(&SIZE, now).is_none(),
+            "one check at a time"
+        );
+        u.record(
+            Verdict::Success,
+            Duration::ZERO,
+            &check,
+            Spend::Estimate,
+            None,
+        );
+        u.release(&check);
+        assert_eq!(u.status(now).state, "healthy");
+
+        fail(&u, Verdict::Failover(Failure::Transient));
+        assert!(
+            u.try_reserve_check(&SIZE, Instant::now()).is_none(),
+            "cooldowns run their course"
+        );
+    }
+
+    #[test]
+    fn reconfigure_keeps_health_unless_the_target_changes() {
+        let u = upstream("tpm = 1000");
+        let now = Instant::now();
+        u.try_reserve(&SIZE, now).unwrap();
+        fail(&u, Verdict::Failover(Failure::Misconfigured));
+
+        let same: UpstreamConfig = toml::from_str(
+            "name = \"a\"\nbase_url = \"https://x\"\napi_key = \"k\"\nmodel = \"m\"\ntpm = 100",
+        )
+        .unwrap();
+        u.reconfigure(same.clone());
+        let status = u.status(now);
+        assert_eq!(status.state, "disabled");
+        assert_eq!(status.tpm_limit, Some(100));
+        assert!(
+            matches!(status.tpm_available, Some(-100..=-99)),
+            "the 200 tokens already spent still count: {:?}",
+            status.tpm_available
+        );
+
+        u.reconfigure(UpstreamConfig {
+            api_key: "fixed".into(),
+            ..same
+        });
+        assert_eq!(u.status(now).state, "healthy");
+        assert_eq!(u.cfg().api_key, "fixed");
     }
 
     #[test]

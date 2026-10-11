@@ -25,11 +25,14 @@ async fn main() -> anyhow::Result<()> {
         config = %path.display(),
         groups = config.groups.len(),
         upstreams = config.upstreams.len(),
-        auth = !config.server.client_tokens.is_empty(),
+        clients = config.clients.len(),
         "loaded config"
     );
 
-    let app = bilirelay::build_app(config)?;
+    let state = bilirelay::AppState::new(config)?;
+    bilirelay::reload::spawn(state.clone(), path.clone());
+    bilirelay::health::spawn(state.clone());
+    let app = bilirelay::router(state);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("failed to bind to {bind}"))?;

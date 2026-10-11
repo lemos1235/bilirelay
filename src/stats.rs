@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
+use axum::response::Response;
 use serde::Serialize;
 
 /// Client-facing counters: one entry per request to /v1/responses, regardless of failover.
@@ -14,12 +15,23 @@ pub struct RelayStats {
     rate_limited: AtomicU64,
     server_errors: AtomicU64,
     saturated: AtomicU64,
+    quota_limited: AtomicU64,
+    tokens: AtomicU64,
     latency_ewma_ms: AtomicU64,
 }
 
-/// Response extension marking a 429 the relay produced itself because every upstream was busy.
-#[derive(Clone, Copy)]
-pub struct Saturated;
+/// Response extension marking a 429 the relay produced itself rather than passed through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejection {
+    /// Every upstream was busy or cooling down.
+    Saturated,
+    /// The calling client exceeded its own rpm / tpm quota.
+    Quota,
+}
+
+/// Response extension carrying the tokens the upstream reported for the request.
+#[derive(Debug, Clone, Copy)]
+pub struct Usage(pub u64);
 
 pub struct InflightGuard<'a>(&'a RelayStats);
 
@@ -40,6 +52,8 @@ impl Default for RelayStats {
             rate_limited: AtomicU64::new(0),
             server_errors: AtomicU64::new(0),
             saturated: AtomicU64::new(0),
+            quota_limited: AtomicU64::new(0),
+            tokens: AtomicU64::new(0),
             latency_ewma_ms: AtomicU64::new(0),
         }
     }
@@ -51,17 +65,21 @@ impl RelayStats {
         InflightGuard(self)
     }
 
-    /// Buckets are disjoint: saturated replies are not also counted as rate limited.
-    pub fn finish(&self, status: StatusCode, saturated: bool, latency: Duration) {
+    /// Buckets are disjoint: relay-made rejections are not also counted as rate limited.
+    pub fn finish(&self, response: &Response, latency: Duration) {
         self.requests.fetch_add(1, Ordering::Relaxed);
-        let bucket = match status.as_u16() {
-            _ if saturated => &self.saturated,
-            200..=299 => &self.success,
-            429 => &self.rate_limited,
-            400..=499 => &self.client_errors,
+        let bucket = match (response.extensions().get::<Rejection>(), response.status()) {
+            (Some(Rejection::Saturated), _) => &self.saturated,
+            (Some(Rejection::Quota), _) => &self.quota_limited,
+            (None, status) if status.is_success() => &self.success,
+            (None, StatusCode::TOO_MANY_REQUESTS) => &self.rate_limited,
+            (None, status) if status.is_client_error() => &self.client_errors,
             _ => &self.server_errors,
         };
         bucket.fetch_add(1, Ordering::Relaxed);
+        if let Some(Usage(tokens)) = response.extensions().get::<Usage>() {
+            self.tokens.fetch_add(*tokens, Ordering::Relaxed);
+        }
         observe_ewma(&self.latency_ewma_ms, latency);
     }
 
@@ -75,6 +93,8 @@ impl RelayStats {
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             server_errors: self.server_errors.load(Ordering::Relaxed),
             saturated: self.saturated.load(Ordering::Relaxed),
+            quota_limited: self.quota_limited.load(Ordering::Relaxed),
+            tokens: self.tokens.load(Ordering::Relaxed),
             latency_ewma_ms: self.latency_ewma_ms.load(Ordering::Relaxed),
         }
     }
@@ -92,7 +112,7 @@ pub(crate) fn observe_ewma(cell: &AtomicU64, latency: Duration) {
     });
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RelayStatus {
     pub uptime_secs: u64,
     pub inflight: usize,
@@ -102,39 +122,49 @@ pub struct RelayStatus {
     pub rate_limited: u64,
     pub server_errors: u64,
     pub saturated: u64,
+    pub quota_limited: u64,
+    pub tokens: u64,
     pub latency_ewma_ms: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
+
+    fn response(code: u16, rejection: Option<Rejection>, usage: Option<u64>) -> Response {
+        let mut response = StatusCode::from_u16(code).unwrap().into_response();
+        if let Some(rejection) = rejection {
+            response.extensions_mut().insert(rejection);
+        }
+        if let Some(tokens) = usage {
+            response.extensions_mut().insert(Usage(tokens));
+        }
+        response
+    }
 
     #[test]
     fn buckets_statuses_and_tracks_inflight() {
         let stats = RelayStats::default();
         let guard = stats.begin();
         assert_eq!(stats.status().inflight, 1);
+        let latency = Duration::from_millis(100);
         for code in [200, 201, 400, 401, 429, 500, 502] {
-            stats.finish(
-                StatusCode::from_u16(code).unwrap(),
-                false,
-                Duration::from_millis(100),
-            );
+            stats.finish(&response(code, None, Some(10)), latency);
         }
-        stats.finish(
-            StatusCode::TOO_MANY_REQUESTS,
-            true,
-            Duration::from_millis(100),
-        );
+        stats.finish(&response(429, Some(Rejection::Saturated), None), latency);
+        stats.finish(&response(429, Some(Rejection::Quota), None), latency);
         drop(guard);
         let status = stats.status();
         assert_eq!(status.inflight, 0);
-        assert_eq!(status.requests, 8);
+        assert_eq!(status.requests, 9);
         assert_eq!(status.success, 2);
         assert_eq!(status.client_errors, 2);
         assert_eq!(status.rate_limited, 1);
         assert_eq!(status.server_errors, 2);
         assert_eq!(status.saturated, 1);
+        assert_eq!(status.quota_limited, 1);
+        assert_eq!(status.tokens, 70);
         assert_eq!(status.latency_ewma_ms, 100);
     }
 }

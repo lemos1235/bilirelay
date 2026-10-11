@@ -120,6 +120,19 @@ impl Bucket {
         }
     }
 
+    /// Applies a new per-minute limit; what was spent in the current window still counts.
+    pub fn resize(&mut self, limit: u64, now: Instant) {
+        self.refill(now);
+        let spent = self.capacity - self.available;
+        self.capacity = limit as f64;
+        self.per_sec = self.capacity / 60.0;
+        self.available = self.capacity - spent;
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.capacity as u64
+    }
+
     fn refill(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
         self.available = (self.available + elapsed * self.per_sec).min(self.capacity);
@@ -246,5 +259,17 @@ mod tests {
         );
         bucket.drain(t0);
         assert_eq!(bucket.available(t0), 0);
+    }
+
+    #[test]
+    fn resize_keeps_spent_budget() {
+        let t0 = Instant::now();
+        let mut bucket = Bucket::per_minute(600, t0);
+        bucket.take(500);
+        bucket.resize(6000, t0);
+        assert_eq!(bucket.available(t0), 5500);
+        bucket.resize(100, t0);
+        assert_eq!(bucket.available(t0), -400);
+        assert_eq!(bucket.capacity(), 100);
     }
 }

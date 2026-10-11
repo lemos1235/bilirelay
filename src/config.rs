@@ -12,8 +12,22 @@ use serde::{Deserialize, Deserializer};
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
+    pub clients: Vec<ClientConfig>,
     pub groups: Vec<GroupConfig>,
     pub upstreams: Vec<UpstreamConfig>,
+}
+
+/// A named caller with its own token and optional per-minute quotas.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfig {
+    pub name: String,
+    pub token: String,
+    #[serde(default)]
+    pub rpm: Option<u64>,
+    #[serde(default)]
+    pub tpm: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +136,10 @@ pub struct UpstreamConfig {
     pub overrides: serde_json::Map<String, serde_json::Value>,
     #[serde(default, deserialize_with = "deserialize_extra_headers")]
     pub extra_headers: HeaderMap,
+    /// Probe this upstream every N seconds while it is unhealthy, so it recovers without
+    /// waiting for client traffic.
+    #[serde(default)]
+    pub health_check_secs: Option<u64>,
 }
 
 impl UpstreamConfig {
@@ -131,6 +149,19 @@ impl UpstreamConfig {
 
     pub fn wait_for_slot(&self) -> Duration {
         Duration::from_secs_f64(self.wait_for_slot_secs)
+    }
+
+    pub fn health_check(&self) -> Option<Duration> {
+        self.health_check_secs.map(Duration::from_secs)
+    }
+
+    /// Whether `other` talks to a different endpoint, account or model, so health observed
+    /// under this configuration says nothing about it.
+    pub fn same_target(&self, other: &Self) -> bool {
+        self.base_url == other.base_url
+            && self.api_key == other.api_key
+            && self.model == other.model
+            && self.api == other.api
     }
 }
 
@@ -201,7 +232,20 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self> {
         let mut config: Config =
             toml::from_str(text).context("failed to parse configuration file")?;
-        config.server.client_tokens.retain(|t| !t.is_empty());
+        // Bare `client_tokens` become anonymous, unlimited clients.
+        let legacy = std::mem::take(&mut config.server.client_tokens);
+        config.clients.extend(
+            legacy
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .enumerate()
+                .map(|(i, token)| ClientConfig {
+                    name: format!("client-{}", i + 1),
+                    token,
+                    rpm: None,
+                    tpm: None,
+                }),
+        );
         if config.server.admin_token.as_deref() == Some("") {
             config.server.admin_token = None;
         }
@@ -216,10 +260,32 @@ impl Config {
                 self.server.bind
             )
         })?;
-        if self.server.client_tokens.is_empty() && !bind.ip().is_loopback() {
+        if self.clients.is_empty() && !bind.ip().is_loopback() {
             bail!(
-                "when server.client_tokens is empty, binding is only allowed on a loopback address to avoid exposing upstream API keys through a public proxy"
+                "when no clients or server.client_tokens are configured, binding is only allowed on a loopback address to avoid exposing upstream API keys through a public proxy"
             );
+        }
+        let mut client_names = HashSet::new();
+        let mut client_tokens = HashSet::new();
+        for client in &self.clients {
+            let name = &client.name;
+            if name.trim().is_empty() {
+                bail!("client names must not be empty");
+            }
+            if !client_names.insert(name.as_str()) {
+                bail!("duplicate client name: '{name}'");
+            }
+            if client.token.is_empty() {
+                bail!("client '{name}'.token must not be empty");
+            }
+            if !client_tokens.insert(client.token.as_str()) {
+                bail!("client '{name}' reuses another client's token");
+            }
+            if client.tpm == Some(0) || client.rpm == Some(0) {
+                bail!(
+                    "client '{name}' tpm / rpm must be greater than 0 (omit them for unlimited rates)"
+                );
+            }
         }
         if self.server.request_deadline_secs == 0 {
             bail!("server.request_deadline_secs must be greater than 0");
@@ -252,6 +318,9 @@ impl Config {
             }
             if upstream.timeout_secs == 0 {
                 bail!("upstream '{name}'.timeout_secs must be greater than 0");
+            }
+            if upstream.health_check_secs == Some(0) {
+                bail!("upstream '{name}'.health_check_secs must be greater than 0");
             }
         }
 
@@ -306,7 +375,16 @@ mod tests {
     #[test]
     fn parses_and_fills_defaults() {
         let config = Config::parse(MINIMAL).unwrap();
-        assert_eq!(config.server.client_tokens, vec!["t1"]);
+        assert!(config.server.client_tokens.is_empty());
+        assert_eq!(
+            config.clients,
+            vec![ClientConfig {
+                name: "client-1".into(),
+                token: "t1".into(),
+                rpm: None,
+                tpm: None,
+            }]
+        );
         assert_eq!(config.upstreams[0].api_key, "sk-abc-x");
         assert_eq!(config.groups[0].strategy, Strategy::Priority);
         assert_eq!(config.groups[0].max_attempts, 3);
@@ -378,6 +456,20 @@ mod tests {
         let config = Config::parse(&chat).unwrap();
         assert_eq!(config.upstreams[0].api, UpstreamApi::ChatCompletions);
         assert!(config.group_uses_chat("translate"));
+    }
+
+    #[test]
+    fn named_clients_extend_legacy_tokens_and_must_be_unique() {
+        let text = format!("{MINIMAL}\n[[clients]]\nname = \"alice\"\ntoken = \"t2\"\nrpm = 60\n");
+        let config = Config::parse(&text).unwrap();
+        let names: Vec<_> = config.clients.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["alice", "client-1"]);
+        assert_eq!(config.clients[0].rpm, Some(60));
+
+        let reused = text.replace("token = \"t2\"", "token = \"t1\"");
+        assert!(Config::parse(&reused).is_err());
+        let zero = text.replace("rpm = 60", "rpm = 0");
+        assert!(Config::parse(&zero).is_err());
     }
 
     #[test]

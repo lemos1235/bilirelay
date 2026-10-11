@@ -242,8 +242,30 @@ struct Snapshot {
     /// Absent on relays that predate client-side stats.
     #[serde(default)]
     relay: Option<RelayView>,
+    /// Absent on relays that predate per-client stats.
+    #[serde(default)]
+    clients: Vec<ClientView>,
     groups: Vec<GroupView>,
     upstreams: Vec<UpstreamView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientView {
+    name: String,
+    inflight: usize,
+    requests: u64,
+    success: u64,
+    client_errors: u64,
+    rate_limited: u64,
+    server_errors: u64,
+    saturated: u64,
+    quota_limited: u64,
+    tokens: u64,
+    latency_ewma_ms: u64,
+    tpm_limit: Option<u64>,
+    tpm_available: Option<i64>,
+    rpm_limit: Option<u64>,
+    rpm_available: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,6 +278,11 @@ struct RelayView {
     rate_limited: u64,
     server_errors: u64,
     saturated: u64,
+    #[serde(default)]
+    quota_limited: u64,
+    /// Tokens billed to clients; older relays only report per-upstream totals.
+    #[serde(default)]
+    tokens: Option<u64>,
     latency_ewma_ms: u64,
 }
 
@@ -295,7 +322,8 @@ enum Metric {
     Limited,
     Errors,
     Tokens,
-    Saturated,
+    /// 429s the relay made itself: saturated or over a client quota.
+    Rejected,
     Latency,
     Inflight,
     SuccessRate,
@@ -347,7 +375,7 @@ impl Metric {
             Self::Limited => "429/s",
             Self::Errors => "Errors/s",
             Self::Tokens => "Tokens/s",
-            Self::Saturated => "Saturated/s",
+            Self::Rejected => "Rejected/s",
             Self::Latency => "Latency (EWMA)",
             Self::Inflight => "Inflight",
             Self::SuccessRate => "Success rate",
@@ -361,7 +389,7 @@ impl Metric {
             return "-".to_string();
         }
         match self {
-            Self::Rps | Self::Ok | Self::Limited | Self::Errors | Self::Saturated => {
+            Self::Rps | Self::Ok | Self::Limited | Self::Errors | Self::Rejected => {
                 format!("{v:.2}/s")
             }
             Self::Tokens => format!("{}/s", compact(v.round() as i64)),
@@ -556,23 +584,71 @@ impl Sample {
         }
     }
 
-    fn relay(r: &RelayView, tokens: u64) -> Self {
+    /// Client-facing traffic, for the relay as a whole or for one client.
+    fn tally(t: &Tally) -> Self {
         Self {
             counters: [
-                Some(r.requests),
-                Some(r.success),
-                Some(r.rate_limited),
-                Some(r.client_errors + r.server_errors),
-                Some(tokens),
-                Some(r.saturated),
+                Some(t.requests),
+                Some(t.success),
+                Some(t.rate_limited),
+                Some(t.client_errors + t.server_errors),
+                Some(t.tokens),
+                Some(t.saturated + t.quota_limited),
             ],
             gauges: [
-                r.latency_ewma_ms as f64,
-                r.inflight as f64,
-                ratio_pct(r.success, r.requests),
+                t.latency_ewma_ms as f64,
+                t.inflight as f64,
+                ratio_pct(t.success, t.requests),
                 f64::NAN,
                 f64::NAN,
             ],
+        }
+    }
+}
+
+/// Client-facing counters shared by the relay totals and each client.
+struct Tally {
+    inflight: usize,
+    requests: u64,
+    success: u64,
+    client_errors: u64,
+    rate_limited: u64,
+    server_errors: u64,
+    saturated: u64,
+    quota_limited: u64,
+    tokens: u64,
+    latency_ewma_ms: u64,
+}
+
+impl Tally {
+    /// `tokens` is passed in because older relays only report it per upstream.
+    fn relay(r: &RelayView, tokens: u64) -> Self {
+        Self {
+            inflight: r.inflight,
+            requests: r.requests,
+            success: r.success,
+            client_errors: r.client_errors,
+            rate_limited: r.rate_limited,
+            server_errors: r.server_errors,
+            saturated: r.saturated,
+            quota_limited: r.quota_limited,
+            tokens,
+            latency_ewma_ms: r.latency_ewma_ms,
+        }
+    }
+
+    fn client(c: &ClientView) -> Self {
+        Self {
+            inflight: c.inflight,
+            requests: c.requests,
+            success: c.success,
+            client_errors: c.client_errors,
+            rate_limited: c.rate_limited,
+            server_errors: c.server_errors,
+            saturated: c.saturated,
+            quota_limited: c.quota_limited,
+            tokens: c.tokens,
+            latency_ewma_ms: c.latency_ewma_ms,
         }
     }
 }
@@ -707,6 +783,10 @@ struct App {
     error: Option<String>,
     series: HashMap<String, Series>,
     relay: Series,
+    /// Per-client history, keyed by client name.
+    clients: HashMap<String, Series>,
+    /// Client the relay view is filtered to; `None` shows every client.
+    client: Option<String>,
     totals: Series,
     colors: HashMap<String, Color>,
     table: TableState,
@@ -734,6 +814,8 @@ impl App {
             error: None,
             series: HashMap::new(),
             relay: Series::default(),
+            clients: HashMap::new(),
+            client: None,
             totals: Series::default(),
             colors: HashMap::new(),
             table: TableState::default().with_selected(0),
@@ -789,8 +871,8 @@ impl App {
             KeyCode::Esc if self.help => self.help = false,
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::Char('?') => self.help = !self.help,
-            // Only the upstream view is about a single upstream; elsewhere there is nothing to select.
-            _ if VIEWS[self.view] != View::Upstream
+            // Only the upstream and relay views have something to select.
+            _ if !matches!(VIEWS[self.view], View::Upstream | View::Relay)
                 && matches!(
                     key.code,
                     KeyCode::Up
@@ -824,6 +906,7 @@ impl App {
             KeyCode::Char('r') => {
                 self.series.clear();
                 self.relay = Series::default();
+                self.clients.clear();
                 self.totals = Series::default();
             }
             KeyCode::Char('+') | KeyCode::Char('=') => self.step_interval(1),
@@ -847,6 +930,16 @@ impl App {
     }
 
     fn select(&mut self, step: isize) {
+        if VIEWS[self.view] == View::Relay {
+            // "All clients" first, then each client in the relay's order.
+            let names: Vec<Option<String>> = std::iter::once(None)
+                .chain(self.client_views().iter().map(|c| Some(c.name.clone())))
+                .collect();
+            let current = names.iter().position(|n| *n == self.client).unwrap_or(0) as isize;
+            let next = (current + step).rem_euclid(names.len() as isize) as usize;
+            self.client = names[next].clone();
+            return;
+        }
         let len = self.upstreams().len();
         if len == 0 {
             return;
@@ -882,9 +975,16 @@ impl App {
         self.totals
             .push(at, self.now_t, Sample::totals(&snapshot.upstreams));
         if let Some(relay) = &snapshot.relay {
-            let tokens = snapshot.upstreams.iter().map(|u| u.tokens).sum();
+            let tokens = relay_tokens(relay, &snapshot.upstreams);
             self.relay
-                .push(at, self.now_t, Sample::relay(relay, tokens));
+                .push(at, self.now_t, Sample::tally(&Tally::relay(relay, tokens)));
+        }
+        for client in &snapshot.clients {
+            self.clients.entry(client.name.clone()).or_default().push(
+                at,
+                self.now_t,
+                Sample::tally(&Tally::client(client)),
+            );
         }
         if self
             .table
@@ -919,6 +1019,23 @@ impl App {
 
     fn upstreams(&self) -> &[UpstreamView] {
         self.snapshot.as_ref().map_or(&[], |s| &s.upstreams)
+    }
+
+    fn relay_tokens(&self) -> u64 {
+        self.snapshot
+            .as_ref()
+            .and_then(|s| Some(relay_tokens(s.relay.as_ref()?, &s.upstreams)))
+            .unwrap_or(0)
+    }
+
+    fn client_views(&self) -> &[ClientView] {
+        self.snapshot.as_ref().map_or(&[], |s| &s.clients)
+    }
+
+    /// The client the relay view is filtered to, if it still exists.
+    fn selected_client(&self) -> Option<&ClientView> {
+        let name = self.client.as_deref()?;
+        self.client_views().iter().find(|c| c.name == name)
     }
 
     fn selected(&self) -> Option<&UpstreamView> {
@@ -1035,6 +1152,29 @@ impl App {
                     ],
                     selected == Some(i),
                 ));
+            }
+        }
+
+        if VIEWS[self.view] == View::Relay && !self.client_views().is_empty() {
+            lines.push(Line::default());
+            lines.push(section("CLIENTS"));
+            let selected = self.selected_client().map(|c| c.name.as_str());
+            let entry = |name: &str, active: bool| {
+                item(
+                    vec![Span::styled(
+                        format!(" {name}"),
+                        Style::new().fg(if active {
+                            theme::accent()
+                        } else {
+                            theme::text()
+                        }),
+                    )],
+                    active,
+                )
+            };
+            lines.push(entry("All", selected.is_none()));
+            for c in self.client_views() {
+                lines.push(entry(&c.name, selected == Some(c.name.as_str())));
             }
         }
 
@@ -1324,6 +1464,12 @@ impl App {
         let mut spans = vec![key("?"), val("help")];
         if VIEWS[self.view] == View::Upstream {
             spans.extend([key("←→"), val("upstream")]);
+        }
+        if VIEWS[self.view] == View::Relay && !self.client_views().is_empty() {
+            let client = self
+                .selected_client()
+                .map_or("all clients", |c| c.name.as_str());
+            spans.extend([key("←→"), val(client)]);
         }
         if VIEWS[self.view] == View::Global {
             spans.extend([key("m"), val(self.focus().label())]);
@@ -1986,61 +2132,190 @@ impl App {
             );
             return;
         };
-        let [top, bottom] = Layout::vertical([Constraint::Fill(1); 2]).areas(area);
+        let clients = self.client_views();
+        let selected = self.selected_client();
+        let [table, top, bottom] = Layout::vertical([
+            Constraint::Length(if clients.is_empty() {
+                0
+            } else {
+                clients.len() as u16 + 3
+            }),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ])
+        .areas(area);
+        if !clients.is_empty() {
+            draw_clients(frame, table, clients, selected.map(|c| c.name.as_str()));
+        }
         let [outcomes, totals] =
-            Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
+            Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .areas(bottom);
-        let trace = |name: &str, color, metric| Trace {
-            name: name.to_string(),
-            color,
-            series: Some(&self.relay),
-            metric,
+        // Everything below the table follows the client filter.
+        let (scope, series, tally) = match selected {
+            Some(c) => (c.name.as_str(), self.clients.get(&c.name), Tally::client(c)),
+            None => (
+                "all clients",
+                Some(&self.relay),
+                Tally::relay(relay, self.relay_tokens()),
+            ),
         };
         self.draw_waveform(
             frame,
             top,
-            "Client requests/s",
-            vec![trace("requests", theme::cyan(), Metric::Rps)],
+            &format!("Client requests/s · {scope}"),
+            vec![Trace {
+                name: "requests".to_string(),
+                color: theme::cyan(),
+                series,
+                metric: Metric::Rps,
+            }],
         );
         self.draw_lines(
             frame,
             outcomes,
-            "Client outcomes/s",
-            outcome_traces(Some(&self.relay), true),
+            &format!("Client outcomes/s · {scope}"),
+            outcome_traces(series, true),
             Metric::Rps,
         );
 
-        let bar = |label: &str, value: u64, color: Color| {
-            Bar::default()
-                .label(Line::from(label.to_string()))
-                .value(value)
-                .text_value(compact(value as i64))
-                .style(Style::new().fg(color))
-                .value_style(Style::new().fg(theme::ink()).bg(color))
-        };
-        frame.render_widget(
-            BarChart::default()
-                .block(
-                    panel("Responses").title_top(
-                        hint(&format!(
-                            "{} total · {} inflight",
-                            relay.requests, relay.inflight
-                        ))
-                        .right_aligned(),
-                    ),
-                )
-                .bar_width(6)
-                .bar_gap(2)
-                .data(BarGroup::default().bars(&[
-                    bar("2xx", relay.success, theme::green()),
-                    bar("4xx", relay.client_errors, theme::blue()),
-                    bar("429", relay.rate_limited, theme::yellow()),
-                    bar("5xx", relay.server_errors, theme::red()),
-                    bar("satur.", relay.saturated, theme::magenta()),
-                ])),
-            totals,
-        );
+        let rows = [
+            ("2xx", tally.success, theme::green()),
+            ("4xx", tally.client_errors, theme::blue()),
+            ("429", tally.rate_limited, theme::yellow()),
+            ("5xx", tally.server_errors, theme::red()),
+            ("saturated", tally.saturated, theme::magenta()),
+            ("quota", tally.quota_limited, theme::orange()),
+        ]
+        .into_iter()
+        .map(|(name, n, color)| StackRow {
+            name: name.to_string(),
+            color,
+            segments: vec![(n as f64, compact(n as i64), color)],
+            total: percent(n, tally.requests),
+        })
+        .collect();
+        let block = panel(&format!("Responses · {scope}"))
+            .title_top(hint("all time · share").right_aligned())
+            .title_bottom(
+                hint(&format!(
+                    "{} total · {} inflight · {} tokens",
+                    compact(tally.requests as i64),
+                    tally.inflight,
+                    compact(tally.tokens as i64)
+                ))
+                .right_aligned(),
+            );
+        draw_stacked(frame, totals, block, rows, false);
     }
+}
+
+/// Tokens billed to clients; older relays only report per-upstream totals.
+fn relay_tokens(relay: &RelayView, upstreams: &[UpstreamView]) -> u64 {
+    relay
+        .tokens
+        .unwrap_or_else(|| upstreams.iter().map(|u| u.tokens).sum())
+}
+
+/// Per-client totals and quotas, shown on the relay view when the relay has named clients.
+/// The client the view is filtered to is highlighted.
+fn draw_clients(frame: &mut Frame, area: Rect, clients: &[ClientView], selected: Option<&str>) {
+    let name_width = clients
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 24) as u16;
+    // (header, width, priority) as in the upstream table.
+    let columns: [(&str, u16, u8); 11] = [
+        ("Client", name_width, 0),
+        ("Active", 6, 1),
+        ("Total", 7, 0),
+        ("OK%", 6, 0),
+        ("4xx", 5, 2),
+        ("429", 5, 2),
+        ("5xx", 5, 2),
+        ("Quota", 6, 0),
+        ("Tokens", 7, 1),
+        ("RPM", 11, 3),
+        ("TPM", 13, 3),
+    ];
+    let keep = fit_columns(&columns, area.width.saturating_sub(4));
+    let pick = |cells: Vec<Cell<'static>>| -> Vec<Cell<'static>> {
+        cells
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(c, k)| k.then_some(c))
+            .collect()
+    };
+    let header = Row::new(pick(
+        columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Cell::from(right(c.0, i > 0)))
+            .collect(),
+    ))
+    .style(Style::new().fg(theme::muted()).bold());
+    let count = |n: u64, color: Color| {
+        Cell::from(right(compact(n as i64), true)).style(Style::new().fg(if n == 0 {
+            theme::border()
+        } else {
+            color
+        }))
+    };
+    let rows: Vec<Row> = clients
+        .iter()
+        .map(|c| {
+            let ok = ratio_pct(c.success, c.requests);
+            let row_style = if selected == Some(c.name.as_str()) {
+                Style::new().fg(theme::text()).bg(theme::selection()).bold()
+            } else {
+                Style::new().fg(theme::text())
+            };
+            Row::new(pick(vec![
+                Cell::from(c.name.clone()).style(Style::new().fg(theme::accent()).bold()),
+                Cell::from(right(c.inflight.to_string(), true)),
+                Cell::from(right(compact(c.requests as i64), true)).bold(),
+                Cell::from(right(Metric::SuccessRate.format(ok), true))
+                    .style(Style::new().fg(success_color(ok))),
+                count(c.client_errors, theme::blue()),
+                count(c.rate_limited + c.saturated, theme::yellow()),
+                count(c.server_errors, theme::red()),
+                count(c.quota_limited, theme::orange()),
+                Cell::from(right(compact(c.tokens as i64), true)),
+                Cell::from(right(budget(c.rpm_available, c.rpm_limit), true)),
+                Cell::from(right(budget(c.tpm_available, c.tpm_limit), true)),
+            ]))
+            .style(row_style)
+        })
+        .collect();
+    let widths: Vec<Constraint> = columns
+        .iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(c, _)| Constraint::Length(c.1))
+        .collect();
+    let latency = clients
+        .iter()
+        .filter(|c| c.requests > 0)
+        .map(|c| format!("{} {}ms", c.name, c.latency_ewma_ms))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    frame.render_widget(
+        Table::new(rows, widths)
+            .header(header)
+            .column_spacing(1)
+            .block(
+                panel("Clients").title_top(
+                    hint(&if latency.is_empty() {
+                        "all time".to_string()
+                    } else {
+                        format!("all time · latency {latency}")
+                    })
+                    .right_aligned(),
+                ),
+            ),
+        area,
+    );
 }
 
 fn outcome_traces(series: Option<&Series>, with_saturated: bool) -> Vec<Trace<'_>> {
@@ -2050,7 +2325,7 @@ fn outcome_traces(series: Option<&Series>, with_saturated: bool) -> Vec<Trace<'_
         ("errors", Metric::Errors, theme::red()),
     ];
     if with_saturated {
-        fields.push(("saturated", Metric::Saturated, theme::magenta()));
+        fields.push(("rejected", Metric::Rejected, theme::magenta()));
     }
     fields
         .into_iter()
@@ -2066,7 +2341,7 @@ fn outcome_traces(series: Option<&Series>, with_saturated: bool) -> Vec<Trace<'_
 fn draw_help(frame: &mut Frame) {
     let keys = [
         ("Tab / Shift-Tab, 1-3", "switch view"),
-        ("← → / ↑ ↓ / h l j k", "select upstream"),
+        ("← → / ↑ ↓ / h l j k", "select upstream / client"),
         ("m / M", "next / previous metric"),
         ("w / W", "next / previous time window"),
         ("+ / -", "slower / faster sampling"),
@@ -2256,6 +2531,9 @@ fn draw_stacked(
     let total_w = rows.iter().map(|r| r.total.len()).max().unwrap_or(0) + 1;
     let bar_w = (inner.width as usize).saturating_sub(label_w + total_w);
     let peak = sums.iter().copied().fold(0.0, f64::max);
+    // Rows are double-spaced to line up with neighbouring bar charts, unless that would push
+    // the last ones out of view.
+    let spaced = inner.height as usize >= rows.len() * 2;
 
     let mut lines = Vec::new();
     for (row, &sum) in rows.iter().zip(&sums) {
@@ -2316,7 +2594,9 @@ fn draw_stacked(
             Style::new().fg(theme::text()),
         ));
         lines.push(Line::from(spans));
-        lines.push(Line::default());
+        if spaced {
+            lines.push(Line::default());
+        }
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -2564,8 +2844,31 @@ mod tests {
                 rate_limited: tick / 5,
                 server_errors: tick / 11,
                 saturated: 0,
+                quota_limited: tick / 13,
+                tokens: Some(tick * 7_000),
                 latency_ewma_ms: 620,
             }),
+            clients: ["translator", "batch"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| ClientView {
+                    name: name.into(),
+                    inflight: i,
+                    requests: tick * (i as u64 + 2),
+                    success: tick * (i as u64 + 2) - tick / 4,
+                    client_errors: tick / 9,
+                    rate_limited: tick / 8,
+                    server_errors: 0,
+                    saturated: 0,
+                    quota_limited: tick / 13 * i as u64,
+                    tokens: tick * 3_100,
+                    latency_ewma_ms: 500 + 40 * i as u64,
+                    tpm_limit: (i == 1).then_some(100_000),
+                    tpm_available: (i == 1).then_some(64_000),
+                    rpm_limit: (i == 1).then_some(60),
+                    rpm_available: (i == 1).then_some(12),
+                })
+                .collect(),
             groups: vec![GroupView {
                 name: "default".into(),
                 upstreams: vec!["volc".into(), "siliconflow".into(), "local".into()],
@@ -2576,6 +2879,55 @@ mod tests {
                 upstream("local", "healthy", 1),
             ],
         }
+    }
+
+    #[test]
+    fn relay_view_filters_by_client() {
+        use ratatui::backend::TestBackend;
+        let (interval, _rx) = watch::channel(Duration::from_secs(1));
+        let mut app = App::new("http://127.0.0.1:8080".into(), interval);
+        let t0 = Instant::now();
+        for tick in 1..10 {
+            app.ingest((
+                t0 + Duration::from_secs(tick),
+                Duration::ZERO,
+                Ok(snapshot(tick)),
+            ));
+        }
+        app.view = VIEWS.iter().position(|v| *v == View::Relay).unwrap();
+        let render = |app: &mut App| {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(150, 42)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..42)
+                .map(|y| {
+                    (0..150)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(render(&mut app).contains("Responses · all clients"));
+
+        app.handle_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(app.client.as_deref(), Some("translator"));
+        let screen = render(&mut app);
+        assert!(screen.contains("Responses · translator"), "{screen}");
+        if std::env::var_os("MONITOR_PREVIEW").is_some() {
+            println!("{screen}");
+        }
+        // translator: 9 * 2 requests, all time.
+        assert!(screen.contains("18 total"), "{screen}");
+        assert!(app.clients["translator"].recent(Metric::Rps).is_finite());
+
+        app.handle_key(KeyEvent::from(KeyCode::Left));
+        app.handle_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(
+            app.client.as_deref(),
+            Some("batch"),
+            "selection wraps around"
+        );
     }
 
     /// Renders every view; set MONITOR_PREVIEW=1 with --nocapture to eyeball the layout.

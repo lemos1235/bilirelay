@@ -45,12 +45,22 @@ pub struct GroupInfo {
 }
 
 impl Pool {
-    pub fn new(config: &Config) -> Self {
+    /// Builds the pool for `config`. Upstreams that already exist in `previous` are reused and
+    /// reconfigured, so a reload keeps their health, budgets, counters and in-flight leases.
+    pub fn new(config: &Config, previous: Option<&Pool>) -> Self {
         let upstreams: Vec<Arc<Upstream>> = config
             .upstreams
             .iter()
             .cloned()
-            .map(|cfg| Arc::new(Upstream::new(cfg)))
+            .map(|cfg| {
+                match previous.and_then(|p| p.upstreams.iter().find(|u| u.cfg().name == cfg.name)) {
+                    Some(existing) => {
+                        existing.reconfigure(cfg);
+                        existing.clone()
+                    }
+                    None => Arc::new(Upstream::new(cfg)),
+                }
+            })
             .collect();
         let groups = config
             .groups
@@ -62,7 +72,7 @@ impl Pool {
                     .map(|name| {
                         upstreams
                             .iter()
-                            .position(|u| &u.cfg.name == name)
+                            .position(|u| &u.cfg().name == name)
                             .expect("configuration validation ensures that group members exist")
                     })
                     .collect();
@@ -76,7 +86,9 @@ impl Pool {
         Self {
             upstreams,
             groups,
-            released: Arc::new(Notify::new()),
+            // Shared across reloads: requests still waiting in the old pool must hear about
+            // slots freed through the new one.
+            released: previous.map_or_else(|| Arc::new(Notify::new()), |p| p.released.clone()),
         }
     }
 
@@ -87,7 +99,7 @@ impl Pool {
             members: group
                 .members
                 .iter()
-                .filter(|i| self.upstreams[**i].cfg.tier >= min_tier)
+                .filter(|i| self.upstreams[**i].cfg().tier >= min_tier)
                 .count(),
         })
     }
@@ -98,9 +110,25 @@ impl Pool {
         names
     }
 
+    pub fn upstreams(&self) -> &[Arc<Upstream>] {
+        &self.upstreams
+    }
+
     pub fn upstream_status(&self) -> Vec<UpstreamStatus> {
         let now = Instant::now();
         self.upstreams.iter().map(|u| u.status(now)).collect()
+    }
+
+    /// Leases upstream `index` for an active health check, if it currently wants one.
+    pub fn lease_check(&self, index: usize, size: &RequestSize) -> Option<Lease> {
+        let upstream = &self.upstreams[index];
+        let ticket = upstream.try_reserve_check(size, Instant::now())?;
+        Some(Lease {
+            upstream: upstream.clone(),
+            index,
+            ticket,
+            released: self.released.clone(),
+        })
     }
 
     pub async fn acquire(
@@ -117,7 +145,7 @@ impl Pool {
             .expect("the caller has already verified that the group exists");
         let mut excluded = tried.to_vec();
         excluded
-            .extend((0..self.upstreams.len()).filter(|&i| self.upstreams[i].cfg.tier < min_tier));
+            .extend((0..self.upstreams.len()).filter(|&i| self.upstreams[i].cfg().tier < min_tier));
         let excluded = excluded.as_slice();
         let mut holds: HashMap<usize, Instant> = HashMap::new();
         loop {
@@ -143,7 +171,7 @@ impl Pool {
                 let earliest_unblock = runtime
                     .members
                     .iter()
-                    .filter(|i| !excluded.contains(i) && self.upstreams[**i].cfg.enabled)
+                    .filter(|i| !excluded.contains(i) && self.upstreams[**i].cfg().enabled)
                     .filter_map(|i| match self.upstreams[*i].admission(size, now) {
                         Admission::Blocked(at) | Admission::Budget(at) => Some(at),
                         _ => None,
@@ -187,7 +215,7 @@ impl Pool {
             .filter(|i| !excluded.contains(i))
         {
             let upstream = &self.upstreams[index];
-            if upstream.cfg.enabled
+            if upstream.cfg().enabled
                 && let Some(ticket) = upstream.try_reserve(size, now)
             {
                 return Pick::Leased(index, ticket);
@@ -212,7 +240,8 @@ impl Pool {
             .filter(|i| !excluded.contains(i))
         {
             let upstream = &self.upstreams[index];
-            if !upstream.cfg.enabled {
+            let cfg = upstream.cfg();
+            if !cfg.enabled {
                 continue;
             }
             let budget_ready = match upstream.admission(size, now) {
@@ -221,7 +250,7 @@ impl Pool {
                 Admission::Full => None,
                 Admission::Budget(at) => Some(at),
             };
-            let wait = upstream.cfg.wait_for_slot();
+            let wait = cfg.wait_for_slot();
             if wait.is_zero() {
                 continue;
             }
