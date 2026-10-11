@@ -1148,8 +1148,7 @@ impl App {
         let latency = match relay {
             Some(r) => r.latency_ewma_ms as f64,
             None => {
-                let busy: Vec<f64> = ups.iter().map(|u| u.latency_ewma_ms as f64).collect();
-                busy.iter().sum::<f64>() / busy.len().max(1) as f64
+                ups.iter().map(|u| u.latency_ewma_ms as f64).sum::<f64>() / ups.len().max(1) as f64
             }
         };
         let slots = inflight as f64 / capacity.max(1) as f64;
@@ -1170,12 +1169,7 @@ impl App {
             Card {
                 title: "Success",
                 value: Metric::SuccessRate.format(ok_pct),
-                color: match ok_pct {
-                    v if !v.is_finite() => theme::muted(),
-                    v if v >= 99.0 => theme::green(),
-                    v if v >= 95.0 => theme::yellow(),
-                    _ => theme::red(),
-                },
+                color: success_color(ok_pct),
                 trend: trend.map(|s| (s, Metric::SuccessRate)),
                 footer: vec![
                     Span::styled("429 ", Style::new().fg(theme::yellow())),
@@ -1447,13 +1441,7 @@ impl App {
                 let load = u.inflight as f64 / u.max_concurrency.max(1) as f64;
                 let mut slots = meter(load, 4, heat(load));
                 slots.push(Span::raw(format!(" {}/{}", u.inflight, u.max_concurrency)));
-                let ok = ratio_pct(u.success, u.requests);
-                let ok_color = match ok {
-                    v if !v.is_finite() => theme::muted(),
-                    v if v >= 99.0 => theme::green(),
-                    v if v >= 95.0 => theme::yellow(),
-                    _ => theme::red(),
-                };
+                let ok_color = success_color(ratio_pct(u.success, u.requests));
                 let count = |n: u64, color: Color| {
                     Cell::from(right(n.to_string(), true)).style(Style::new().fg(if n == 0 {
                         theme::border()
@@ -2177,6 +2165,15 @@ fn state_style(state: &str) -> Style {
         _ => theme::muted(),
     };
     Style::new().fg(color).bold()
+}
+
+fn success_color(pct: f64) -> Color {
+    match pct {
+        v if !v.is_finite() => theme::muted(),
+        v if v >= 99.0 => theme::green(),
+        v if v >= 95.0 => theme::yellow(),
+        _ => theme::red(),
+    }
 }
 
 /// Green when idle, yellow when busy, red when nearly exhausted.

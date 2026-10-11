@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::classify::{Failure, Penalty, Verdict, penalty};
 use crate::config::UpstreamConfig;
+use crate::stats::observe_ewma;
 use crate::tokens::{Bucket, RequestSize};
 
 pub struct Upstream {
@@ -207,7 +208,7 @@ impl Upstream {
                 } else {
                     self.errors.fetch_add(1, Ordering::Relaxed);
                 }
-                self.observe_latency(latency);
+                observe_ewma(&self.latency_ewma_ms, latency);
                 if fresh {
                     if health.consecutive_failures > 0 {
                         tracing::info!(upstream = %self.cfg.name, failures = health.consecutive_failures, "upstream recovered");
@@ -241,17 +242,6 @@ impl Upstream {
                 Some(applied)
             }
         }
-    }
-
-    fn observe_latency(&self, latency: Duration) {
-        let sample = latency.as_millis().min(u64::MAX as u128) as u64;
-        let prev = self.latency_ewma_ms.load(Ordering::Relaxed);
-        let next = if prev == 0 {
-            sample
-        } else {
-            (prev * 4 + sample) / 5
-        };
-        self.latency_ewma_ms.store(next, Ordering::Relaxed);
     }
 
     pub fn status(&self, now: Instant) -> UpstreamStatus {

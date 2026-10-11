@@ -62,15 +62,7 @@ impl RelayStats {
             _ => &self.server_errors,
         };
         bucket.fetch_add(1, Ordering::Relaxed);
-        let sample = latency.as_millis().min(u64::MAX as u128) as u64;
-        self.latency_ewma_ms
-            .update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
-                if prev == 0 {
-                    sample
-                } else {
-                    (prev * 4 + sample) / 5
-                }
-            });
+        observe_ewma(&self.latency_ewma_ms, latency);
     }
 
     pub fn status(&self) -> RelayStatus {
@@ -86,6 +78,18 @@ impl RelayStats {
             latency_ewma_ms: self.latency_ewma_ms.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Folds a latency sample into a millisecond EWMA (weight 1/5); 0 means "no sample yet".
+pub(crate) fn observe_ewma(cell: &AtomicU64, latency: Duration) {
+    let sample = latency.as_millis().min(u64::MAX as u128) as u64;
+    cell.update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+        if prev == 0 {
+            sample
+        } else {
+            prev.saturating_mul(4).saturating_add(sample) / 5
+        }
+    });
 }
 
 #[derive(Debug, Serialize)]

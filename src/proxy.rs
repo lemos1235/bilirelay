@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -372,13 +374,29 @@ async fn send(
     }
 }
 
+/// Runs once per attempt, so it borrows the client's fields and clones only the ones an override
+/// deep-merges into, rather than copying a potentially large input on every failover.
 pub fn rewrite(payload: &Map<String, Value>, upstream: &UpstreamConfig) -> Vec<u8> {
-    let mut body = payload.clone();
-    body.insert("model".to_string(), Value::String(upstream.model.clone()));
+    let model = Value::String(upstream.model.clone());
+    let mut body: BTreeMap<&str, Cow<'_, Value>> = payload
+        .iter()
+        .map(|(key, value)| (key.as_str(), Cow::Borrowed(value)))
+        .collect();
+    body.insert("model", Cow::Borrowed(&model));
     for field in &upstream.drop_fields {
-        body.remove(field);
+        body.remove(field.as_str());
     }
-    merge(&mut body, &upstream.overrides);
+    for (key, value) in &upstream.overrides {
+        let merged = match (body.get(key.as_str()).map(AsRef::as_ref), value) {
+            (Some(Value::Object(existing)), Value::Object(patch)) => {
+                let mut existing = existing.clone();
+                merge(&mut existing, patch);
+                Cow::Owned(Value::Object(existing))
+            }
+            _ => Cow::Borrowed(value),
+        };
+        body.insert(key, merged);
+    }
     serde_json::to_vec(&body).expect("serializing a Value cannot fail")
 }
 
