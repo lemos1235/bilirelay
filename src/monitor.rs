@@ -547,7 +547,8 @@ struct Sample {
 }
 
 impl Sample {
-    fn upstream(u: &UpstreamView) -> Self {
+    /// `ok_pct` is the success rate over the window, which raw counters alone can't give.
+    fn upstream(u: &UpstreamView, ok_pct: f64) -> Self {
         let budget = |v: Option<i64>| v.map_or(f64::NAN, |v| v as f64);
         Self {
             counters: [
@@ -561,7 +562,7 @@ impl Sample {
             gauges: [
                 u.latency_ewma_ms as f64,
                 u.inflight as f64,
-                ratio_pct(u.success, u.requests),
+                ok_pct,
                 budget(u.tpm_available),
                 budget(u.rpm_available),
             ],
@@ -585,7 +586,7 @@ impl Sample {
     }
 
     /// Client-facing traffic, for the relay as a whole or for one client.
-    fn tally(t: &Tally) -> Self {
+    fn tally(t: &Tally, ok_pct: f64) -> Self {
         Self {
             counters: [
                 Some(t.requests),
@@ -598,7 +599,7 @@ impl Sample {
             gauges: [
                 t.latency_ewma_ms as f64,
                 t.inflight as f64,
-                ratio_pct(t.success, t.requests),
+                ok_pct,
                 f64::NAN,
                 f64::NAN,
             ],
@@ -634,6 +635,44 @@ impl Tally {
             quota_limited: r.quota_limited,
             tokens,
             latency_ewma_ms: r.latency_ewma_ms,
+        }
+    }
+
+    fn counters(&self) -> [u64; 8] {
+        [
+            self.requests,
+            self.success,
+            self.client_errors,
+            self.rate_limited,
+            self.server_errors,
+            self.saturated,
+            self.quota_limited,
+            self.tokens,
+        ]
+    }
+
+    /// The same tally with its counters replaced by counts within a window.
+    fn windowed(self, counts: [u64; 8]) -> Self {
+        let [
+            requests,
+            success,
+            client_errors,
+            rate_limited,
+            server_errors,
+            saturated,
+            quota_limited,
+            tokens,
+        ] = counts;
+        Self {
+            requests,
+            success,
+            client_errors,
+            rate_limited,
+            server_errors,
+            saturated,
+            quota_limited,
+            tokens,
+            ..self
         }
     }
 
@@ -756,6 +795,52 @@ impl Series {
     }
 }
 
+/// Raw counter readings, so readouts can show exact counts within the selected window.
+struct Counts<const N: usize> {
+    samples: VecDeque<(f64, [u64; N])>,
+}
+
+impl<const N: usize> Default for Counts<N> {
+    fn default() -> Self {
+        Self {
+            samples: VecDeque::new(),
+        }
+    }
+}
+
+impl<const N: usize> Counts<N> {
+    fn push(&mut self, t: f64, counters: [u64; N]) {
+        self.samples.push_back((t, counters));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(at, _)| *at < t - HISTORY_SECS)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Events counted by samples taken since `since`, as `Series::total` counts them.
+    fn since(&self, since: f64) -> [u64; N] {
+        let mut out = [0; N];
+        for (before, (t, now)) in self.samples.iter().zip(self.samples.iter().skip(1)) {
+            if *t < since {
+                continue;
+            }
+            for ((slot, now), before) in out.iter_mut().zip(now).zip(before.1) {
+                // Counters going backwards means the relay restarted and counted `now` since.
+                *slot += if *now >= before { now - before } else { *now };
+            }
+        }
+        out
+    }
+}
+
+/// Upstream counters the windowed readouts show: requests, success, 429, errors and tokens.
+fn upstream_counts(u: &UpstreamView) -> [u64; 5] {
+    [u.requests, u.success, u.rate_limited, u.errors, u.tokens]
+}
+
 /// One plotted line: a series, the metric drawn from it, and how it is labelled.
 struct Trace<'a> {
     name: String,
@@ -788,6 +873,10 @@ struct App {
     /// Client the relay view is filtered to; `None` shows every client.
     client: Option<String>,
     totals: Series,
+    /// Raw counters behind the windowed totals, keyed like the series above.
+    upstream_counts: HashMap<String, Counts<5>>,
+    relay_counts: Counts<8>,
+    client_counts: HashMap<String, Counts<8>>,
     colors: HashMap<String, Color>,
     table: TableState,
     view: usize,
@@ -817,6 +906,9 @@ impl App {
             clients: HashMap::new(),
             client: None,
             totals: Series::default(),
+            upstream_counts: HashMap::new(),
+            relay_counts: Counts::default(),
+            client_counts: HashMap::new(),
             colors: HashMap::new(),
             table: TableState::default().with_selected(0),
             view: 0,
@@ -908,6 +1000,9 @@ impl App {
                 self.relay = Series::default();
                 self.clients.clear();
                 self.totals = Series::default();
+                self.upstream_counts.clear();
+                self.relay_counts = Counts::default();
+                self.client_counts.clear();
             }
             KeyCode::Char('+') | KeyCode::Char('=') => self.step_interval(1),
             KeyCode::Char('-') | KeyCode::Char('_') => self.step_interval(-1),
@@ -961,29 +1056,46 @@ impl App {
         self.error = None;
         self.updated = Some(at);
         self.now_t = (at - self.started).as_secs_f64();
+        let since = self.since();
         for upstream in &snapshot.upstreams {
             let next = self.colors.len();
             self.colors
                 .entry(upstream.name.clone())
                 .or_insert_with(|| theme::hex(PALETTE[next % PALETTE.len()]));
+            let counts = self
+                .upstream_counts
+                .entry(upstream.name.clone())
+                .or_default();
+            counts.push(self.now_t, upstream_counts(upstream));
+            let [requests, success, ..] = counts.since(since);
             self.series.entry(upstream.name.clone()).or_default().push(
                 at,
                 self.now_t,
-                Sample::upstream(upstream),
+                Sample::upstream(upstream, ratio_pct(success, requests)),
             );
         }
         self.totals
             .push(at, self.now_t, Sample::totals(&snapshot.upstreams));
         if let Some(relay) = &snapshot.relay {
             let tokens = relay_tokens(relay, &snapshot.upstreams);
-            self.relay
-                .push(at, self.now_t, Sample::tally(&Tally::relay(relay, tokens)));
+            let tally = Tally::relay(relay, tokens);
+            self.relay_counts.push(self.now_t, tally.counters());
+            let [requests, success, ..] = self.relay_counts.since(since);
+            self.relay.push(
+                at,
+                self.now_t,
+                Sample::tally(&tally, ratio_pct(success, requests)),
+            );
         }
         for client in &snapshot.clients {
+            let tally = Tally::client(client);
+            let counts = self.client_counts.entry(client.name.clone()).or_default();
+            counts.push(self.now_t, tally.counters());
+            let [requests, success, ..] = counts.since(since);
             self.clients.entry(client.name.clone()).or_default().push(
                 at,
                 self.now_t,
-                Sample::tally(&Tally::client(client)),
+                Sample::tally(&tally, ratio_pct(success, requests)),
             );
         }
         if self
@@ -1006,6 +1118,23 @@ impl App {
 
     fn since(&self) -> f64 {
         self.now_t - self.window()
+    }
+
+    /// An upstream's requests, success, 429, errors and tokens within the window.
+    fn upstream_window(&self, name: &str) -> [u64; 5] {
+        let since = self.since();
+        self.upstream_counts
+            .get(name)
+            .map_or([0; 5], |c| c.since(since))
+    }
+
+    fn client_window(&self, c: &ClientView) -> Tally {
+        let since = self.since();
+        let counts = self
+            .client_counts
+            .get(&c.name)
+            .map_or([0; 8], |n| n.since(since));
+        Tally::client(c).windowed(counts)
     }
 
     fn color(&self, name: &str) -> Color {
@@ -1263,22 +1392,24 @@ impl App {
                 .filter(|v| v.is_finite())
                 .sum()
         };
-        let requests: u64 = ups.iter().map(|u| u.requests).sum();
-        let success: u64 = ups.iter().map(|u| u.success).sum();
-        let limited: u64 = ups.iter().map(|u| u.rate_limited).sum();
-        let errors: u64 = ups.iter().map(|u| u.errors).sum();
-        let tokens: u64 = ups.iter().map(|u| u.tokens).sum();
+        let [requests, success, limited, errors, tokens] = ups
+            .iter()
+            .map(|u| self.upstream_window(&u.name))
+            .fold([0; 5], |acc, n| std::array::from_fn(|i| acc[i] + n[i]));
         let inflight: usize = ups.iter().map(|u| u.inflight).sum();
         let capacity: usize = ups.iter().map(|u| u.max_concurrency).sum();
         let healthy = ups.iter().filter(|u| u.state == "healthy").count();
         let trend = relay.map(|_| &self.relay);
 
         let (rps, total, ok_pct) = match relay {
-            Some(r) => (
-                self.relay.recent(Metric::Rps),
-                r.requests,
-                ratio_pct(r.success, r.requests),
-            ),
+            Some(_) => {
+                let [requests, success, ..] = self.relay_counts.since(since);
+                (
+                    self.relay.recent(Metric::Rps),
+                    requests,
+                    ratio_pct(success, requests),
+                )
+            }
             None => (
                 upstream_sum(Metric::Rps),
                 requests,
@@ -1563,20 +1694,18 @@ impl App {
         ))
         .style(Style::new().fg(theme::muted()).bold())
         .bottom_margin(0);
-        let since = self.since();
-        let window_total = |name: &str| {
-            self.series
-                .get(name)
-                .map_or(0.0, |s| s.total(Metric::Rps, since))
-        };
-        let sum: f64 = self.upstreams().iter().map(|u| window_total(&u.name)).sum();
+        let sum: u64 = self
+            .upstreams()
+            .iter()
+            .map(|u| self.upstream_window(&u.name)[0])
+            .sum();
         let rows: Vec<Row> = self
             .upstreams()
             .iter()
             .map(|u| {
-                let total = window_total(&u.name);
-                let share = if sum >= 0.5 {
-                    format!("{:.1}%", total / sum * 100.0)
+                let [total, success, limited, errors, _] = self.upstream_window(&u.name);
+                let share = if sum > 0 {
+                    format!("{:.1}%", total as f64 / sum as f64 * 100.0)
                 } else {
                     "-".to_string()
                 };
@@ -1587,7 +1716,7 @@ impl App {
                 let load = u.inflight as f64 / u.max_concurrency.max(1) as f64;
                 let mut slots = meter(load, 4, heat(load));
                 slots.push(Span::raw(format!(" {}/{}", u.inflight, u.max_concurrency)));
-                let ok_color = success_color(ratio_pct(u.success, u.requests));
+                let ok_color = success_color(ratio_pct(success, total));
                 let count = |n: u64, color: Color| {
                     Cell::from(right(n.to_string(), true)).style(Style::new().fg(if n == 0 {
                         theme::border()
@@ -1603,13 +1732,13 @@ impl App {
                         Metric::Rps.format(rps).trim_end_matches("/s").to_string(),
                         true,
                     )),
-                    Cell::from(right(total.round().to_string(), true)).bold(),
+                    Cell::from(right(total.to_string(), true)).bold(),
                     Cell::from(right(share, true))
                         .style(Style::new().fg(self.color(&u.name)).bold()),
-                    Cell::from(right(percent(u.success, u.requests), true))
+                    Cell::from(right(percent(success, total), true))
                         .style(Style::new().fg(ok_color)),
-                    count(u.rate_limited, theme::yellow()),
-                    count(u.errors, theme::red()),
+                    count(limited, theme::yellow()),
+                    count(errors, theme::red()),
                     Cell::from(right(budget(u.tpm_available, u.tpm_limit), true)),
                     Cell::from(right(budget(u.rpm_available, u.rpm_limit), true)),
                     Cell::from(note(u)).style(Style::new().fg(theme::yellow())),
@@ -1626,16 +1755,9 @@ impl App {
         let table = Table::new(rows, widths)
             .header(header)
             .column_spacing(1)
-            .block(
-                panel("Upstreams").title_top(
-                    hint(&format!(
-                        "total & share · last {:.0}s · {} requests",
-                        self.window(),
-                        sum.round()
-                    ))
-                    .right_aligned(),
-                ),
-            );
+            .block(panel("Upstreams").title_top(
+                hint(&format!("last {:.0}s · {} requests", self.window(), sum)).right_aligned(),
+            ));
         frame.render_widget(table, area);
     }
 
@@ -1691,6 +1813,7 @@ impl App {
             spans.extend(v);
             Line::from(spans)
         };
+        let window = self.upstream_window(&u.name);
         let note = note(u);
         let state = if note.starts_with(&u.state) {
             vec![Span::styled(note, state_style(&u.state))]
@@ -1708,12 +1831,13 @@ impl App {
                 kv(
                     "traffic",
                     vec![Span::raw(format!(
-                        "{} · ok {} of {} · 429 {} · err {}",
+                        "{} · ok {} of {} · 429 {} · err {} · last {:.0}s",
                         Metric::Rps.format(metric_now(Metric::Rps)),
-                        percent(u.success, u.requests),
-                        u.requests,
-                        u.rate_limited,
-                        u.errors
+                        percent(window[1], window[0]),
+                        window[0],
+                        window[2],
+                        window[3],
+                        self.window()
                     ))],
                 ),
                 kv(
@@ -1797,8 +1921,12 @@ impl App {
             };
             frame.render_widget(widget, row);
         }
-        let total: u64 = self.upstreams().iter().map(|x| x.requests).sum();
-        let share = ratio(u.requests as f64, total as f64);
+        let total: u64 = self
+            .upstreams()
+            .iter()
+            .map(|x| self.upstream_window(&x.name)[0])
+            .sum();
+        let share = ratio(self.upstream_window(&u.name)[0] as f64, total as f64);
         frame.render_widget(
             gauge(
                 format!("{:<6}{:>12}", "share", format!("{:.0}%", share * 100.0)),
@@ -1991,7 +2119,7 @@ impl App {
         frame.render_widget(chart, area);
     }
 
-    /// `metric` now and requests all time on top, outcomes now and all time below.
+    /// `metric` now and requests within the window on top, outcomes now and within it below.
     fn draw_bar_grid(&self, frame: &mut Frame, area: Rect, metric: Metric) {
         let [top, bottom] = Layout::vertical([Constraint::Fill(1); 2]).areas(area);
         let [now, total] = Layout::horizontal([Constraint::Fill(1); 2]).areas(top);
@@ -2074,48 +2202,51 @@ impl App {
         draw_stacked(frame, area, block, rows, false);
     }
 
-    /// Requests per upstream since the relay started, with each one's share of the total.
+    /// Requests per upstream within the window, with each one's share of the total.
     fn draw_request_totals(&self, frame: &mut Frame, area: Rect) {
         let upstreams = self.upstreams();
-        let sum: u64 = upstreams.iter().map(|u| u.requests).sum();
+        let requests: Vec<u64> = upstreams
+            .iter()
+            .map(|u| self.upstream_window(&u.name)[0])
+            .collect();
+        let sum: u64 = requests.iter().sum();
         let rows = upstreams
             .iter()
-            .map(|u| {
+            .zip(requests)
+            .map(|(u, n)| {
                 let color = self.color(&u.name);
                 StackRow {
                     name: u.name.clone(),
                     color,
-                    segments: vec![(u.requests as f64, compact(u.requests as i64), color)],
-                    total: percent(u.requests, sum),
+                    segments: vec![(n as f64, compact(n as i64), color)],
+                    total: percent(n, sum),
                 }
             })
             .collect();
         let block = panel("Cumulative requests")
-            .title_top(hint("all time · share").right_aligned())
+            .title_top(hint(&format!("last {:.0}s · share", self.window())).right_aligned())
             .title_bottom(hint(&format!("{} total", compact(sum as i64))).right_aligned());
         draw_stacked(frame, area, block, rows, false);
     }
 
-    /// ok / 429 / errors per upstream since the relay started, as a share of its requests.
+    /// ok / 429 / errors per upstream within the window, as a share of its requests.
     fn draw_outcome_totals(&self, frame: &mut Frame, area: Rect) {
         let rows = self
             .upstreams()
             .iter()
             .map(|u| {
-                let values = [u.success, u.rate_limited, u.errors].map(|n| n as f64);
+                let [_, success, limited, errors, _] = self.upstream_window(&u.name);
+                let values = [success, limited, errors].map(|n| n as f64);
                 StackRow {
                     name: u.name.clone(),
                     color: self.color(&u.name),
                     segments: outcome_segments(values, |v| compact(v as i64)),
-                    total: format!(
-                        "{} ok",
-                        percent(u.success, u.success + u.rate_limited + u.errors)
-                    ),
+                    total: format!("{} ok", percent(success, success + limited + errors)),
                 }
             })
             .collect();
         let block = panel("Cumulative outcomes")
-            .title_top(hint("all time · 100%").right_aligned())
+            .title_top(hint(&format!("last {:.0}s · 100%", self.window())).right_aligned())
             .title_bottom(legend().right_aligned());
         draw_stacked(frame, area, block, rows, true);
     }
@@ -2145,18 +2276,31 @@ impl App {
         ])
         .areas(area);
         if !clients.is_empty() {
-            draw_clients(frame, table, clients, selected.map(|c| c.name.as_str()));
+            let rows: Vec<(&ClientView, Tally)> =
+                clients.iter().map(|c| (c, self.client_window(c))).collect();
+            draw_clients(
+                frame,
+                table,
+                &rows,
+                selected.map(|c| c.name.as_str()),
+                self.window(),
+            );
         }
         let [outcomes, totals] =
             Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .areas(bottom);
         // Everything below the table follows the client filter.
         let (scope, series, tally) = match selected {
-            Some(c) => (c.name.as_str(), self.clients.get(&c.name), Tally::client(c)),
+            Some(c) => (
+                c.name.as_str(),
+                self.clients.get(&c.name),
+                self.client_window(c),
+            ),
             None => (
                 "all clients",
                 Some(&self.relay),
-                Tally::relay(relay, self.relay_tokens()),
+                Tally::relay(relay, self.relay_tokens())
+                    .windowed(self.relay_counts.since(self.since())),
             ),
         };
         self.draw_waveform(
@@ -2183,8 +2327,8 @@ impl App {
             ("4xx", tally.client_errors, theme::blue()),
             ("429", tally.rate_limited, theme::yellow()),
             ("5xx", tally.server_errors, theme::red()),
-            ("saturated", tally.saturated, theme::magenta()),
-            ("quota", tally.quota_limited, theme::orange()),
+            ("sat", tally.saturated, theme::magenta()),
+            ("qta", tally.quota_limited, theme::orange()),
         ]
         .into_iter()
         .map(|(name, n, color)| StackRow {
@@ -2195,7 +2339,7 @@ impl App {
         })
         .collect();
         let block = panel(&format!("Responses · {scope}"))
-            .title_top(hint("all time · share").right_aligned())
+            .title_top(hint(&format!("last {:.0}s · share", self.window())).right_aligned())
             .title_bottom(
                 hint(&format!(
                     "{} total · {} inflight · {} tokens",
@@ -2216,12 +2360,18 @@ fn relay_tokens(relay: &RelayView, upstreams: &[UpstreamView]) -> u64 {
         .unwrap_or_else(|| upstreams.iter().map(|u| u.tokens).sum())
 }
 
-/// Per-client totals and quotas, shown on the relay view when the relay has named clients.
-/// The client the view is filtered to is highlighted.
-fn draw_clients(frame: &mut Frame, area: Rect, clients: &[ClientView], selected: Option<&str>) {
+/// Per-client totals within the window and quotas, shown on the relay view when the relay
+/// has named clients. The client the view is filtered to is highlighted.
+fn draw_clients(
+    frame: &mut Frame,
+    area: Rect,
+    clients: &[(&ClientView, Tally)],
+    selected: Option<&str>,
+    window: f64,
+) {
     let name_width = clients
         .iter()
-        .map(|c| c.name.chars().count())
+        .map(|(c, _)| c.name.chars().count())
         .max()
         .unwrap_or(8)
         .clamp(8, 24) as u16;
@@ -2264,8 +2414,8 @@ fn draw_clients(frame: &mut Frame, area: Rect, clients: &[ClientView], selected:
     };
     let rows: Vec<Row> = clients
         .iter()
-        .map(|c| {
-            let ok = ratio_pct(c.success, c.requests);
+        .map(|(c, t)| {
+            let ok = ratio_pct(t.success, t.requests);
             let row_style = if selected == Some(c.name.as_str()) {
                 Style::new().fg(theme::text()).bg(theme::selection()).bold()
             } else {
@@ -2274,14 +2424,14 @@ fn draw_clients(frame: &mut Frame, area: Rect, clients: &[ClientView], selected:
             Row::new(pick(vec![
                 Cell::from(c.name.clone()).style(Style::new().fg(theme::accent()).bold()),
                 Cell::from(right(c.inflight.to_string(), true)),
-                Cell::from(right(compact(c.requests as i64), true)).bold(),
+                Cell::from(right(compact(t.requests as i64), true)).bold(),
                 Cell::from(right(Metric::SuccessRate.format(ok), true))
                     .style(Style::new().fg(success_color(ok))),
-                count(c.client_errors, theme::blue()),
-                count(c.rate_limited + c.saturated, theme::yellow()),
-                count(c.server_errors, theme::red()),
-                count(c.quota_limited, theme::orange()),
-                Cell::from(right(compact(c.tokens as i64), true)),
+                count(t.client_errors, theme::blue()),
+                count(t.rate_limited + t.saturated, theme::yellow()),
+                count(t.server_errors, theme::red()),
+                count(t.quota_limited, theme::orange()),
+                Cell::from(right(compact(t.tokens as i64), true)),
                 Cell::from(right(budget(c.rpm_available, c.rpm_limit), true)),
                 Cell::from(right(budget(c.tpm_available, c.tpm_limit), true)),
             ]))
@@ -2296,8 +2446,8 @@ fn draw_clients(frame: &mut Frame, area: Rect, clients: &[ClientView], selected:
         .collect();
     let latency = clients
         .iter()
-        .filter(|c| c.requests > 0)
-        .map(|c| format!("{} {}ms", c.name, c.latency_ewma_ms))
+        .filter(|(c, _)| c.requests > 0)
+        .map(|(c, _)| format!("{} {}ms", c.name, c.latency_ewma_ms))
         .collect::<Vec<_>>()
         .join(" · ");
     frame.render_widget(
@@ -2307,9 +2457,9 @@ fn draw_clients(frame: &mut Frame, area: Rect, clients: &[ClientView], selected:
             .block(
                 panel("Clients").title_top(
                     hint(&if latency.is_empty() {
-                        "all time".to_string()
+                        format!("last {window:.0}s")
                     } else {
-                        format!("all time · latency {latency}")
+                        format!("last {window:.0}s · latency {latency}")
                     })
                     .right_aligned(),
                 ),
@@ -2779,6 +2929,18 @@ mod tests {
     }
 
     #[test]
+    fn counts_sum_deltas_within_the_window_across_restarts() {
+        let mut counts = Counts::<1>::default();
+        for (t, n) in [(0.0, 5), (2.0, 8), (4.0, 12), (6.0, 3), (8.0, 10)] {
+            counts.push(t, [n]);
+        }
+        assert_eq!(counts.since(0.0), [3 + 4 + 3 + 7]);
+        // The relay restarted before t=6, so that sample counts its 3 from scratch.
+        assert_eq!(counts.since(5.0), [3 + 7]);
+        assert_eq!(counts.since(9.0), [0]);
+    }
+
+    #[test]
     fn resample_takes_bucket_maxima_and_holds_across_gaps() {
         let mut series = Series::default();
         let t0 = Instant::now();
@@ -2917,8 +3079,8 @@ mod tests {
         if std::env::var_os("MONITOR_PREVIEW").is_some() {
             println!("{screen}");
         }
-        // translator: 9 * 2 requests, all time.
-        assert!(screen.contains("18 total"), "{screen}");
+        // translator: 2 requests per tick, counted from the first sample at tick 1.
+        assert!(screen.contains("16 total"), "{screen}");
         assert!(app.clients["translator"].recent(Metric::Rps).is_finite());
 
         app.handle_key(KeyEvent::from(KeyCode::Left));
