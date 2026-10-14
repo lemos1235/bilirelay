@@ -379,8 +379,8 @@ impl Metric {
             Self::Latency => "Latency (EWMA)",
             Self::Inflight => "Inflight",
             Self::SuccessRate => "Success rate",
-            Self::Tpm => "TPM available",
-            Self::Rpm => "RPM available",
+            Self::Tpm => "TPM used",
+            Self::Rpm => "RPM used",
         }
     }
 
@@ -549,7 +549,7 @@ struct Sample {
 impl Sample {
     /// `ok_pct` is the success rate over the window, which raw counters alone can't give.
     fn upstream(u: &UpstreamView, ok_pct: f64) -> Self {
-        let budget = |v: Option<i64>| v.map_or(f64::NAN, |v| v as f64);
+        let used = |available, limit| used(available, limit).map_or(f64::NAN, |v| v as f64);
         Self {
             counters: [
                 Some(u.requests),
@@ -563,8 +563,8 @@ impl Sample {
                 u.latency_ewma_ms as f64,
                 u.inflight as f64,
                 ok_pct,
-                budget(u.tpm_available),
-                budget(u.rpm_available),
+                used(u.tpm_available, u.tpm_limit),
+                used(u.rpm_available, u.rpm_limit),
             ],
         }
     }
@@ -1910,11 +1910,11 @@ impl App {
         ] {
             let widget = match (available, limit) {
                 (Some(available), Some(limit)) => {
-                    let left = ratio(available.max(0) as f64, limit as f64);
+                    let used = ratio((limit as i64 - available) as f64, limit as f64);
                     gauge(
                         format!("{name:<6}{:>12}", budget(Some(available), Some(limit))),
-                        left,
-                        heat(1.0 - left),
+                        used,
+                        heat(used),
                     )
                 }
                 _ => gauge(format!("{name:<6}{:>12}", "unlimited"), 0.0, theme::green()),
@@ -2795,13 +2795,16 @@ fn percent(part: u64, total: u64) -> String {
     Metric::SuccessRate.format(ratio_pct(part, total))
 }
 
+/// Quota consumed out of the limit; exceeds the limit when settled usage overdrew the bucket.
 fn budget(available: Option<i64>, limit: Option<u64>) -> String {
-    match (available, limit) {
-        (Some(available), Some(limit)) => {
-            format!("{}/{}", compact(available), compact(limit as i64))
-        }
+    match (used(available, limit), limit) {
+        (Some(used), Some(limit)) => format!("{}/{}", compact(used), compact(limit as i64)),
         _ => "-".to_string(),
     }
+}
+
+fn used(available: Option<i64>, limit: Option<u64>) -> Option<i64> {
+    Some(limit? as i64 - available?)
 }
 
 fn uptime(secs: u64) -> String {
@@ -2888,6 +2891,14 @@ mod tests {
         assert_eq!(compact(60_000), "60.0k");
         assert_eq!(compact(-1_500), "-1.5k");
         assert_eq!(compact(5_000_000), "5.0M");
+    }
+
+    #[test]
+    fn budget_shows_used_out_of_limit() {
+        assert_eq!(budget(Some(60_000), Some(60_000)), "0/60.0k");
+        assert_eq!(budget(Some(42_000), Some(60_000)), "18.0k/60.0k");
+        assert_eq!(budget(Some(-1_500), Some(60_000)), "61.5k/60.0k");
+        assert_eq!(budget(None, None), "-");
     }
 
     fn sample(requests: u64, latency: f64) -> Sample {
